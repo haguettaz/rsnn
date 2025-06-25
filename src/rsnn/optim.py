@@ -4,139 +4,7 @@ from typing import Optional, Tuple
 import numpy as np
 import numpy.typing as npt
 
-from rsnn.constants import (FIRING_THRESHOLD, LEFT_LIMIT, REFRACTORY_PERIOD,
-                            REFRACTORY_RESET)
-
-# def compute_state_template(
-#     f_time: np.float64,  # optional??
-#     bf_time: np.float64,  # optional??
-#     in_times: npt.NDArray[np.float64],
-#     in_channels: npt.NDArray[np.intp],
-#     n_in_channels: np.intp,
-#     f_thresh: np.float64,
-#     zmax: np.float64,
-#     dzmin: np.float64,
-# ) -> Tuple[
-#     npt.NDArray[np.float64],  # zi_f_c: shape (n_in_channels + 1)
-#     npt.NDArray[np.float64],  # z_f_lim: shape (1,)
-#     npt.NDArray[np.float64],  # z_start: shape (n_z_intervals)
-#     npt.NDArray[np.float64],  # z_length: shape (n_z_intervals)
-#     npt.NDArray[np.float64],  # z_lim: shape (n_z_intervals)
-#     npt.NDArray[np.float64],  # zi_c0: shape (n_z_intervals, n_in_channels + 1)
-#     npt.NDArray[np.float64],  # zi_c1: shape (n_z_intervals, n_in_channels + 1)
-#     npt.NDArray[np.float64],  # dz_start: shape (n_dz_intervals)
-#     npt.NDArray[np.float64],  # dz_length: shape (n_dz_intervals)
-#     npt.NDArray[np.float64],  # dz_lim: shape (n_dz_intervals)
-#     npt.NDArray[np.float64],  # dzi_c0: shape (n_dz_intervals, n_in_channels + 1)
-#     npt.NDArray[np.float64],  # dzi_c1: shape (n_dz_intervals, n_in_channels + 1)
-# ]:
-#     """
-#     Compute the coefficients (c0nk and c1nk) defining the states of every input (indexed by k) for any time between 0 and f_time, on disjoint intervals (indexed by n).
-#     The intervals partition the time range [0, f_time] in n_intervals = in_times.size + 3 intervals from the following time markers:
-#     - 0.0, the start of the time range
-#     - bf_time, the time before firing (the beginning of the active region)
-#     - f_time, the firing time
-#     - in_times, the input spike times.
-#     The intervals are reconstructed from their start and length.
-#     The signal (c0nk + c1nk * dt) * exp(-dt) for 0 <= dt < length[n] then corresponds to
-#     a) the kth input signal on the nth interval [start[n], start[n] + length[n]) if start[n] + length[n] < bf_time.
-#     b) the derivative of the kth input signal on the nth interval [start[n], start[n] + length[n]) if start[n] + length[n] < f_time and start[n] >= f_time.
-#     c) the kth input signal on the nth interval [start[n], start[n] + length[n]) if start[n] = f_time.
-
-#     Args:
-#         f_time (np.double): _description_
-#         bf_time (np.double): _description_
-#         in_times (np.ndarray): _description_
-#         in_channels (np.ndarray): _description_
-#         n_in_channels (np.intp): _description_
-#         zmax (np.double): _description_
-#         dzmin (np.double): _description_
-
-#     Returns:
-#         Tuple[npt.NDArray[np.float64], ...]: A tuple containing:
-#             - zi_f_c: shape (n_in_channels + 1)
-#             - z_f_lim: shape (1,)
-#             - z_start: shape (n_z_intervals)
-#             - z_length: shape (n_z_intervals)
-#             - z_lim: shape (n_z_intervals)
-#             - zi_c0: shape (n_z_intervals, n_in_channels + 1)
-#             - zi_c1: shape (n_z_intervals, n_in_channels + 1)
-#             - dz_start: shape (n_dz_intervals)
-#             - dz_length: shape (n_dz_intervals)
-#             - dz_lim: shape (n_dz_intervals)
-#             - dzi_c0: shape (n_dz_intervals, n_in_channels + 1)
-#             - dzi_c1: shape (n_dz_intervals, n_in_channels + 1)
-#     """
-#     # Extract the in_times and in_channels that are valid
-#     if f_time is not None:
-#         valid = (in_times >= 0.0) & ((in_times < f_time))
-#     else:
-#         valid = in_times >= 0.0
-
-#     in_times = in_times[valid]
-#     in_channels = in_channels[valid]
-
-#     # Initialize the starts array
-#     if bf_time is not None:
-#         z_start = np.concatenate((in_times, np.array([bf_time, 0.0])))
-#     else:
-#         z_start = np.concatenate((in_times, np.array([0.0])))
-
-#     # Initialize the coefficients array
-#     zi_c0 = np.zeros((z_start.size, n_in_channels + 1))
-#     zi_c1 = np.zeros((z_start.size, n_in_channels + 1))
-#     zi_c1[np.arange(in_times.size), in_channels] = 1.0
-#     zi_c0[-1, n_in_channels] = REFRACTORY_RESET  # refractory reset
-
-#     # Sort the coefficients according to their starts
-#     sorter = np.argsort(z_start)
-#     z_start = z_start[sorter]
-#     z_length = np.diff(
-#         z_start, append=f_time
-#     )  # time differences = lengths of the intervals
-
-#     # Input signals for the potential
-#     zi_c0 = zi_c0[sorter]
-#     zi_c1 = zi_c1[sorter]
-#     for n in range(z_start.size - 1):
-#         zi_c0[n + 1] += (zi_c0[n] + zi_c1[n] * z_length[n]) * np.exp(-z_length[n])
-#         zi_c1[n + 1] += zi_c1[n] * np.exp(-z_length[n])
-
-#     # print(f"zi_c0={zi_c0}")
-#     # print(f"zi_c1={zi_c1}")
-
-#     # Potential constraints at f_time (z >= f_thresh <=> -z <= -f_thresh)
-#     zi_f_c = -(zi_c0[-1] + zi_c1[-1] * z_length[-1]) * np.exp(-z_length[-1])
-#     # print(f"zi_f_c={zi_f_c}")
-#     # The last coefficient is the refractory reset
-#     z_f_lim = np.array(-f_thresh)
-
-#     # Potential constraints before f_time (z <= zlim))
-#     z_lim = np.full(z_start.shape, zmax)
-#     z_lim[z_start >= bf_time] = f_thresh
-
-#     # Potential derivative constraints (z' >= dzmin <=> -z' <= -dzmin)
-#     active = z_start >= bf_time
-#     dz_start = z_start[active]
-#     dz_length = z_length[active]
-#     dz_lim = np.full(dz_start.shape, -dzmin)
-#     dzi_c0 = zi_c0[active] - zi_c1[active]
-#     dzi_c1 = zi_c1[active]
-
-#     return (
-#         zi_f_c,
-#         z_f_lim,
-#         z_start,
-#         z_length,
-#         z_lim,
-#         zi_c0,
-#         zi_c1,
-#         dz_start,
-#         dz_length,
-#         dz_lim,
-#         dzi_c0,
-#         dzi_c1,
-#     )
+from rsnn.constants import *
 
 
 def compute_ck(
@@ -227,7 +95,7 @@ def find_maximum(
     c1: npt.NDArray[np.float64],
     length: npt.NDArray[np.float64],
     lim: npt.NDArray[np.float64],
-) -> Tuple[int | np.intp, float | np.float64, float | np.float64]:
+) -> Tuple[np.intp, np.float64, np.float64]:
     # coef and ends are assumed to be non-empty (otherwise, this is an unconstrained problem)
     # for derivatives, adapt coef and zmax accordingly
     # the intervals of interest are defined by the ends array, the intervals are (0, ends)
@@ -344,28 +212,30 @@ class Solver:
 
     def add_constraint(
         self,
-        ant: npt.NDArray[np.float64],
-        bn: npt.NDArray[np.float64],
+        a: npt.NDArray[np.float64],
+        b: npt.NDArray[np.float64],
     ) -> int:
-        ant_norm = np.linalg.norm(ant)
+        a_norm = np.linalg.norm(a)
 
-        if ant_norm > 0.0:
+        if a_norm > 0.0:  # a is not the zero vector
             self.n_cstrs += 1
 
             self.xt = np.append(self.xt, 0.0)
 
-            ant /= ant_norm
-            bn /= ant_norm
+            a /= a_norm
+            b /= a_norm
 
-            Aant = (self.A @ ant).reshape(-1, 1)
+            Aat = (self.A @ a).reshape(-1, 1)
 
-            self.Vfxt = np.block([[self.Vfxt, Aant], [Aant.T, 1.0]])
-            self.mfxt = np.append(self.mfxt, -bn)
+            self.Vfxt = np.block([[self.Vfxt, Aat], [Aat.T, 1.0]])
+            self.mfxt = np.append(self.mfxt, -b)
 
-            self.A = np.vstack((self.A, ant))
-            self.b = np.append(self.b, bn)
+            self.A = np.vstack((self.A, a))
+            self.b = np.append(self.b, b)
             return 0
-        else:
+        elif b >= 0.0:  # if b >= 0 then ax = 0 <= b for every x
+            return 0
+        else:  # if b < 0 then a x = 0 > b for every x
             return -1
 
 
@@ -562,6 +432,7 @@ class Neuron:
             )
         else:
             z_vmax = -np.inf
+            z_dtmax = 0.0
 
         if self.n_dz_intervals > 0:
             self.dz_c0 = (
@@ -575,11 +446,12 @@ class Neuron:
             )
         else:
             dz_vmax = -np.inf
+            dz_dtmax = 0.0
 
         if z_vmax <= feas_tol and dz_vmax <= feas_tol:
             return 1
         else:
-            if z_vmax > dz_vmax:
+            if z_vmax > dz_vmax and np.isfinite(z_dtmax):
                 return self.solver.add_constraint(
                     (self.z_ck0[z_imax, :-1] + z_dtmax * self.z_ck1[z_imax, :-1])
                     * np.exp(-z_dtmax),
@@ -624,67 +496,7 @@ class Neuron:
                 - -1 if the optimization failed to find a feasible solution.
         """
 
-        # # inspike.conn_id and inspike.time
-        # conn_ids = list(set(inspike.conn_id for inspike in inspikes))
-        # conn_ids.sort()
-
-        # n_in_channels = np.max(in_channels, initial=-1) + 1
-
-        # Init in_coef and ends, which remain constant during the optimization
-        # Contains both information for potential and derivatives
-
-        # # Add constraints at firing times
-        # solver = Solver(n_in_channels)
-
-        # in_coef, starts, durations, bounds = [], [], [], []
-        # for n in range(f_times.size):
-        #     # f_time = (f_times[n] - f_times[n - 1]) % period
-        #     # bf_time = f_time - eps
-        #     in_coef_n, starts_n, durations_n, bounds_n = compute_in_states(
-        #         (f_times[n] - f_times[n - 1]) % period,
-        #         (f_times[n] - eps - f_times[n - 1]) % period,
-        #         (in_times - f_times[n - 1]) % period,
-        #         in_channels,
-        #         n_in_channels,
-        #     )
-        #     in_coef.append(in_coef_n[:, :-1])
-        #     starts.append(starts_n[:-1] + f_times[n - 1])
-        #     durations.append(durations_n[:-1])
-        #     bounds.append(bounds_n[:-1])
-
-        #     # Add the firing time constraint a_n x <= b_n (equivalent to -a_n x >= -b_n)
-        #     solver.add_constraint(in_coef_n[0, -1], bounds_n[-1])
-
-        # in_coef = np.concatenate(in_coef, axis=1)
-        # starts = np.concatenate(starts)
-        # durations = np.concatenate(durations)
-        # bounds = np.concatenate(bounds)
-
-        # if self.solver is None:
-        #     raise ValueError("Solver is not initialized. Call init_solver() first.")
-
-        res_refine = self.refine_constraints(feas_tol)
-        if res_refine == 1:
-            print(f"Constraints refined, optimal solution found in 0 iteration.")
-            self.weight = np.copy(self.solver.x)
-            return 1
-
         for i in range(n_iter):
-            # 2. Refine constraints based on the current primal solution. If no constraints are violated, then the primal solution is optimal.
-            res_refine = self.refine_constraints(feas_tol)
-            if res_refine == 1:
-                print(
-                    f"Constraints refined, optimal solution found in {i+1} iterations."
-                )
-                self.weight = np.copy(self.solver.x)
-                return 1
-            
-            if res_refine == -1:
-                print(
-                    f"Constraints refinement failed in iteration {i+1}, no feasible solution found."
-                )
-                return -1
-
             # 1. DCD algorithm: repeat the following steps until convergence (of the primal cost) or n_iter reached:
             # 1.1 dual coordinate descent step in the dual space
             # 1.2 convert the dual vector to a primal vector
@@ -693,87 +505,20 @@ class Neuron:
             if res_dcd < 1:
                 return res_dcd
 
+            # 2. Refine constraints based on the current primal solution. If no constraints are violated, then the primal solution is optimal.
+            res_refine = self.refine_constraints(feas_tol)
+            if res_refine == 1:
+                print(
+                    f"Solved in {i+1} iterations! Cost is {self.solver.cost:.3f} for {self.solver.n_cstrs} constraints."
+                )
+                self.weight = np.copy(self.solver.x)
+                return 1
+
+            if res_refine == -1:
+                print(
+                    f"Constraints refinement failed in iteration {i+1}, problem is infeasible."
+                )
+                return -1
+
         print("Maximum iterations reached without convergence.")
         return 0
-
-    # def init_states(
-    #     f_time: float,
-    #     bf_time: float,
-    #     in_times: np.ndarray,
-    #     in_channels: np.ndarray,
-    #     n_in_channels: int,
-    #     zmax: float = 0.0,
-    #     dzmin: float = 1e-6,
-    # ) -> Tuple[
-    #     np.ndarray,  # in_coef: shape (2, n_intervals, n_channels)
-    #     np.ndarray,  # starts: shape (n_intervals)
-    #     np.ndarray,  # lengths: shape (n_intervals)
-    #     np.ndarray,  # bounds: shape (n_intervals)
-    # ]:
-    #     """
-    #     Compute the coefficients (c0nk and c1nk) defining the states of every input (indexed by k) for any time between 0 and f_time, on disjoint intervals (indexed by n).
-    #     The intervals partition the time range [0, f_time] in n_intervals = in_times.size + 3 intervals from the following time markers:
-    #     - 0.0, the start of the time range
-    #     - bf_time, the time before firing (the beginning of the active region)
-    #     - f_time, the firing time
-    #     - in_times, the input spike times.
-    #     The intervals are reconstructed from their start and length.
-    #     The signal (c0nk + c1nk * dt) * exp(-dt) for 0 <= dt < length[n] then corresponds to
-    #     a) the kth input signal on the nth interval [start[n], start[n] + length[n]) if start[n] + length[n] < bf_time.
-    #     b) the derivative of the kth input signal on the nth interval [start[n], start[n] + length[n]) if start[n] + length[n] < f_time and start[n] >= f_time.
-    #     c) the kth input signal on the nth interval [start[n], start[n] + length[n]) if start[n] = f_time.
-
-    #     Args:
-    #         f_time (np.double): _description_
-    #         bf_time (np.double): _description_
-    #         in_times (np.ndarray): _description_
-    #         in_channels (np.ndarray): _description_
-    #         n_in_channels (np.intp): _description_
-    #         zmax (np.double): _description_
-    #         dzmin (np.double): _description_
-
-    #     Returns:
-    #         np.ndarray: the coefficients defining the input signals by parts with shape (2, n_intervals, n_channels)
-    #         np.ndarray: the times at which the intervals start with shape (n_intervals)
-    #         np.ndarray: the lengths the intervals, with shape (n_intervals)
-    #         np.ndarray: the template bounds for each interval, with shape (n_intervals)
-    #     """
-
-    #     # Extract the in_times and in_channels that are valid, i.e., within the range [0, f_time)
-    #     valid = (in_times >= 0.0) & (in_times < f_time)
-    #     in_times = in_times[valid]
-    #     in_channels = in_channels[valid]
-
-    #     # Initialize the starts array
-    #     starts = np.concatenate((in_times, np.array([0.0, f_time, bf_time])))
-
-    #     # Initialize the coefficients array
-    #     in_coef = np.zeros((2, starts.size, n_in_channels))
-    #     in_coef[1, np.arange(in_times.size), in_channels] = 1.0
-
-    #     # Sort the coefficients according to their starts
-    #     sort_ids = np.argsort(starts)
-    #     starts = starts[sort_ids]
-    #     lengths = np.diff(
-    #         starts, append=f_time
-    #     )  # time differences = lengths of the intervals
-    #     # ends = starts + lengths
-    #     bounds = np.full(starts.shape, zmax)
-
-    #     in_coef = in_coef[:, sort_ids, :]
-    #     for n in range(starts.size - 1):
-    #         in_coef[1, n + 1] += in_coef[1, n] * np.exp(-lengths[n])
-    #         in_coef[0, n + 1] += (in_coef[0, n] + in_coef[1, n] * lengths[n]) * np.exp(
-    #             -lengths[n]
-    #         )
-
-    #     # The signal of interest on the active region is the (negative) derivative
-    #     active = (starts >= bf_time) & (starts < f_time)
-    #     in_coef[0, active] -= in_coef[1, active]  # (negative) derivative
-    #     bounds[active] = -dzmin
-
-    #     # The signal of interest for the firing time is the potential
-    #     in_coef[:, -1] = -in_coef[:, -1]  # (negative) derivative
-    #     bounds[-1] = -FIRING_THRESHOLD
-
-    #     return in_coef, starts, lengths, bounds
