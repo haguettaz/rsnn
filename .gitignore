@@ -136,3 +136,5 @@ dmypy.json
 
 # MAC OS
 .DS_Store
+
+/private
