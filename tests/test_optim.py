@@ -19,17 +19,17 @@ def test_solver_initialization():
     assert np.allclose(
         np.diag(solver.A @ solver.A.T), np.ones(3)
     )  # Check normalization
-    assert np.allclose(solver.Vfxt, solver.A @ solver.A.T)  # Check Vfxt
-    assert np.allclose(solver.mfxt, -solver.b)  # Check mfxt
+    assert np.allclose(solver.Wbxt_N, solver.A @ solver.A.T)  # Check Wbxt_N
+    assert np.allclose(solver.xibxt_N, -solver.b)  # Check xibxt_N
 
 
-def test_solver_dual_coordinate_descent():
+def test_solver_dbffd():
     # Initialize the solver
-    solver = Solver(np.intp(10))
+    solver = Solver(10)
     assert solver.n_vars == 10
     assert solver.n_cstrs == 0
 
-    status = solver.dual_coordinate_descent()
+    status = solver.dbffd()
     assert status == 1
 
     # Add a few linear constraints a x <= b
@@ -104,7 +104,7 @@ def test_solver_dual_coordinate_descent():
     assert solver.n_vars == 10
     assert solver.n_cstrs == 4
 
-    status = solver.dual_coordinate_descent()
+    status = solver.dbffd()
     assert status is 1
     assert np.isclose(
         solver.cost, 1.4293642842883392
@@ -134,38 +134,57 @@ def test_solver_dual_coordinate_descent():
     assert solver.n_cstrs == 5
 
     # Perform dual coordinate descent
-    status = solver.dual_coordinate_descent()
+    status = solver.dbffd()
     assert status == -1  # Status should be -1 for infeasibility
     assert np.isposinf(
         solver.cost
     )  # Cost should be positive infinity for infeasibility
 
-
 def test_neuron_init_solver():
+    np.random.seed(42)  # For reproducibility
+    
     neuron = Neuron()
+
+    f_times = np.sort(np.random.uniform(0.0, 80.0, size=20))
+    f_times += np.arange(20)
+
+    in_times = np.random.uniform(0.0, 100.0, size=2000)
+    in_channels = np.random.randint(0, 100, size=2000)
+
     neuron.init_solver(
-        f_times=np.random.uniform(0.0, 100.0, size=20),
-        in_times=np.random.uniform(0.0, 100.0, size=1000),
-        in_channels=np.random.randint(0, 100, size=1000),
-        period=np.float64(100.0),
+        np.copy(f_times),
+        np.copy(in_times),
+        np.copy(in_channels),
+        period=100.0,
     )
+
     assert neuron.solver is not None
     assert neuron.solver.n_vars == 100
     assert neuron.solver.n_cstrs == 20
 
+
 def test_neuron_learn():
+    np.random.seed(42)  # For reproducibility
+    
     neuron = Neuron()
+
+    # firing times are separated by at least 1 time unit
+    f_times = np.sort(np.random.uniform(0.0, 90.0, size=10))
+    f_times += np.arange(10)
+
+    in_times = np.random.uniform(0.0, 100.0, size=2000)
+    in_channels = np.random.randint(0, 100, size=2000)
+
     neuron.init_solver(
-        f_times=np.random.uniform(0.0, 100.0, size=10),
-        in_times=np.random.uniform(0.0, 100.0, size=1000),
-        in_channels=np.random.randint(0, 100, size=1000),
-        period=np.float64(100.0),
+        np.copy(f_times),
+        np.copy(in_times),
+        np.copy(in_channels),
+        period=100.0,
     )
     assert neuron.solver is not None
     assert neuron.solver.n_vars == 100
     assert neuron.solver.n_cstrs == 10
 
-    res = neuron.learn(feas_tol=np.float64(1e-3), n_iter=10000)
+    res = neuron.learn()
     assert res == 1
-
-    assert False
+    assert np.isclose(neuron.solver.cost, 3.2043950176058726)

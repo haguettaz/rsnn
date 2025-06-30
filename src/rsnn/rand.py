@@ -183,7 +183,7 @@ def expected_n_f_times(period: float, f_rate: float) -> float:
     return np.inner(ns, pns)
 
 
-def rand_p_f_times(
+def rand_f_times(
     n_channels: int,
     period: float,
     f_rate: float,

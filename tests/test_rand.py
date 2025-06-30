@@ -107,7 +107,7 @@ def test_rand_connections_fin_fout():
             assert dmin <= t <= dmax
 
 
-def test_rand_p_f_times():
+def test_rand_f_times():
     """
     Test the random (periodic) firing times generation function.
     """
@@ -115,21 +115,21 @@ def test_rand_p_f_times():
     period = 100.0
 
     f_rate = 0.0
-    p_f_times = rand_p_f_times(n_neurons, period, f_rate)
-    assert len(p_f_times) == n_neurons
-    for p_f_time_n in p_f_times:
+    f_times = rand_f_times(n_neurons, period, f_rate)
+    assert len(f_times) == n_neurons
+    for p_f_time_n in f_times:
         assert is_valid_f_times(p_f_time_n, period)
 
     f_rate = 1.0
-    p_f_times = rand_p_f_times(n_neurons, period, f_rate)
-    assert len(p_f_times) == n_neurons
-    for p_f_time_n in p_f_times:
+    f_times = rand_f_times(n_neurons, period, f_rate)
+    assert len(f_times) == n_neurons
+    for p_f_time_n in f_times:
         assert is_valid_f_times(p_f_time_n, period)
 
     f_rate = 10.0
-    p_f_times = rand_p_f_times(n_neurons, period, f_rate)
-    assert len(p_f_times) == n_neurons
-    for p_f_time_n in p_f_times:
+    f_times = rand_f_times(n_neurons, period, f_rate)
+    assert len(f_times) == n_neurons
+    for p_f_time_n in f_times:
         assert is_valid_f_times(p_f_time_n, period)
 
 
@@ -137,7 +137,7 @@ def test_rand_jit_f_times():
     """
     Test the random jittered firing times generation function.
     """
-    f_times = rand_p_f_times(1, 50.0, 1.0)[0]
+    f_times = rand_f_times(1, 50.0, 1.0)[0]
 
     jit_f_times = rand_jit_f_times(f_times, 1e-1, -np.inf, np.inf)[0]
     assert is_valid_f_times(jit_f_times)
