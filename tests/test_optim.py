@@ -164,6 +164,8 @@ def test_neuron_init_solver():
 
 
 def test_neuron_learn():
+    import time
+
     np.random.seed(42)  # For reproducibility
     
     neuron = Neuron()
@@ -181,10 +183,16 @@ def test_neuron_learn():
         np.copy(in_channels),
         period=100.0,
     )
-    assert neuron.solver is not None
-    assert neuron.solver.n_vars == 100
-    assert neuron.solver.n_cstrs == 10
+    res = neuron.learn(order=1, conv_tol=1e-9)
+    assert res == 1
+    assert np.isclose(neuron.solver.cost, 3.2043950176058726)
 
-    res = neuron.learn()
+    neuron.init_solver(
+        np.copy(f_times),
+        np.copy(in_times),
+        np.copy(in_channels),
+        period=100.0,
+    )
+    res = neuron.learn(order=2, conv_tol=1e-9)
     assert res == 1
     assert np.isclose(neuron.solver.cost, 3.2043950176058726)

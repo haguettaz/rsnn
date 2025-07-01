@@ -132,101 +132,100 @@ class Solver:
         self.A = np.empty((0, n_vars))
         self.b = np.empty((0,))
 
-        # self.Vfxt = np.empty((0, 0), dtype=np.float64)
-        # self.mfxt = np.empty((0), dtype=np.float64)
-
         self.xibxt_N = np.empty((0,))
         self.Wbxt_N = np.empty((0, 0), dtype=np.float64)
-
-        # self.en_xibxtn = np.empty((self.n_cstrs, 1))
-        # self.Wbxtn_en = np.empty((self.n_cstrs, self.n_cstrs))
 
         self.mfut = np.zeros((self.n_cstrs,))
         self.Vfut = np.zeros((self.n_cstrs,))
         self.beta = np.full((self.n_cstrs,), 1e-12)
 
-    def reset(self, n_vars: int | np.intp):
+    def solve(self, feas_tol: float=1e-6, conv_tol: float=1e-6, n_iter: int=1000, order:int | np.intp=2) -> int:
         """
-        Reset the solver with a new number of variables.
+        Solve the optimization problem defined by the constraints in the dual space.
 
-        Parameters:
-            n_vars (int | np.intp): The new number of variables.
+        Args:
+            feas_tol (float): Tolerance for feasibility.
+            conv_tol (float): Tolerance for convergence.
+            n_iter (int): Maximum number of iterations to run.
+
+        Returns:
+            int: The status of the optimization:
+                - 1 if the optimization converged to a solution,
+                - 0 if the optimization failed to converge,
+                - -1 if the optimization failed to find a feasible solution.
         """
-        self.n_vars = n_vars
-        self.n_cstrs = 0
 
-        self.x = np.zeros(self.n_vars, dtype=np.float64)
-        self.xt = np.zeros(self.n_cstrs, dtype=np.float64)
-        self.cost = 0.0
+        if self.n_cstrs > 0:
+            if order == 2:
+                return self.dbffd(feas_tol, conv_tol, n_iter)
+            elif order == 1:
+                return self.dpcd(feas_tol, conv_tol, n_iter)
+            else:
+                raise ValueError(f"Unsupported order {order}. Supported orders are 1 (=projected dual coordinate descent) and 2 (=backward filtering forward deciding).")
+            
+        else:
+            self.cost = 0.0
+            self.x = np.zeros(self.n_vars, dtype=np.float64)
+            print("Feasible (trivial) solution found.")
+            return 1
 
-        self.A = np.empty((0, n_vars))
-        self.b = np.empty((0,))
+    def dpcd(self, feas_tol: float=1e-6, conv_tol: float=1e-6, n_iter: int=1000) -> int:
+        """
+        Dual projected coordinate descent algorithm.
+        This updates the dual solution vector xt based on the current constraints.
 
-        self.xibxt_N = np.empty((0,))
-        self.Wbxt_N = np.empty((0, 0), dtype=np.float64)
+        Returns:
+            (int): the status of the optimization:
+                - 1 if the optimization converged to a solution,
+                - 0 if the optimization failed to converge,
+                - -1 if the optimization failed to find a feasible solution.
 
-        # self.en_xibxtn = np.empty((self.n_cstrs, 1))
-        # self.Wbxtn_en = np.empty((self.n_cstrs, self.n_cstrs))
+        """
+        en_xibxtn = np.empty((self.n_cstrs, 1))
 
-        self.mfut = np.zeros((self.n_cstrs,))
-        self.Vfut = np.zeros((self.n_cstrs,))
-        self.beta = np.full((self.n_cstrs,), 1e-12)
+        xibxt = np.empty((self.n_cstrs,))
 
-    # def dual_to_primal(self):
-    #     self.x = -self.xt @ self.A
+        cost_buf = np.full((2,), np.inf)
+        
+        for i in range(n_iter):
+            # Backward Filtering
+            np.copyto(xibxt, self.xibxt_N)
+            for n in range(self.n_cstrs - 1, -1, -1):
+                np.copyto(en_xibxtn[n], xibxt[n])
+                xibxt -= self.mfut[n] * self.Wbxt_N[n]
+            
+            # Forward Deciding
+            self.xt.fill(0.0)
+            for n in range(self.n_cstrs):
+                Vbut = 1 / self.Wbxt_N[n, n]
+                mbut = (
+                    Vbut
+                    * (
+                        en_xibxtn[n] - np.inner(self.Wbxt_N[n], self.xt)
+                    ).squeeze()
+                )
+                utn = np.clip(mbut, 0.0, None)  # cf. Table 2 in LiLoeliger2024
+                self.xt[n] += utn
+                self.mfut[n] = np.abs(utn)  # cf. Table 1 in LiLoeliger2024
 
-    # def dual_coordinate_descent(
-    #     self, feas_tol: float, conv_tol: float, n_iter: int
-    # ) -> int:
-    #     """
-    #     Run coordinate descent in the dual space to optimize the dual solution.
-    #     This updates the dual solution vector xt based on the current constraints.
+            self.x = -self.xt @ self.A
+            self.cost = np.linalg.norm(self.x).astype(np.float64)
+            
+            if np.any(np.abs(self.cost - cost_buf) < conv_tol):
+                print(f"Converged after {i+1} iterations")
+                max_violation = self.max_violation()
+                if max_violation <= feas_tol:
+                    print(f"Feasible solution found with cost {self.cost}.")
+                    return 1
+                else:
+                    self.cost = np.inf
+                    print(f"Primal problem is infeasible, maximum violation is {max_violation}.")
+                    return -1
 
-    #     Returns:
-    #         (int): the status of the optimization:
-    #             - 1 if the optimization converged to a solution,
-    #             - 0 if the optimization failed to converge,
-    #             - -1 if the optimization failed to find a feasible solution.
+            cost_buf = np.append(cost_buf[1:], self.cost)
 
-    #     """
-    #     if self.n_cstrs > 0:
-    #         prev_cost = np.inf
-    #         for i in range(n_iter):
-    #             for n in range(self.n_cstrs):
-    #                 self.xt[n] = np.clip(
-    #                     self.xt[n] + self.mfxt[n] - self.Vfxt[n] @ self.xt, 0, None
-    #                 )
-    #             self.dual_to_primal()
-
-    #             self.cost = np.linalg.norm(self.x).astype(np.float64)
-    #             if np.abs(prev_cost - self.cost) < conv_tol:
-    #                 print(f"Converged after {i+1} iterations with cost {self.cost}")
-    #                 if self.is_valid(feas_tol):
-    #                     print("Feasible solution found.")
-    #                     return 1
-    #                 # if np.all(self.A @ self.x - self.b <= self.feas_tol):
-    #                 #     return (1, cost)
-    #                 else:
-    #                     print("Primal problem is infeasible.")
-    #                     self.cost = np.inf
-    #                     return -1
-
-    #             prev_cost = self.cost
-
-    #         print("Reached maximum number of coordinate descents.")
-    #         return 0
-    #     else:
-    #         self.cost = 0.0
-    #         self.x = np.zeros(self.n_vars, dtype=np.float64)
-    #         print("Feasible (trivial) solution found.")
-    #         return 1
-
-    # def update_primal_solution(self):
-    #     """
-    #     Update the primal solution vector x based on the current dual solution xt and constraints A, b.
-    #     """
-    #     self.x = -self.xt @ self.A
-    #     self.cost = np.linalg.norm(self.x).astype(np.float64)
+        print("Reached maximum number of coordinate descents.")
+        return 0
 
     def dbffd(self, feas_tol: float=1e-6, conv_tol: float=1e-6, n_iter: int=1000) -> int:
         """
@@ -240,93 +239,73 @@ class Solver:
                 - -1 if the optimization failed to find a feasible solution.
 
         """
-        if self.n_cstrs > 0:
-            en_xibxtn = np.empty((self.n_cstrs, 1))
-            Wbxtn_en = np.empty((self.n_cstrs, self.n_cstrs))
+        en_xibxtn = np.empty((self.n_cstrs, 1))
+        Wbxtn_en = np.empty((self.n_cstrs, self.n_cstrs))
 
-            xibxt = np.empty((self.n_cstrs,))
-            Wbxt = np.empty((self.n_cstrs, self.n_cstrs))
+        xibxt = np.empty((self.n_cstrs,))
+        Wbxt = np.empty((self.n_cstrs, self.n_cstrs))
 
-            cost_buf = np.full((3,), np.inf)
-            # xt_buf = np.full((3, self.n_cstrs), np.nan)
+        cost_buf = np.full((2,), np.inf)
+        
+        for i in range(n_iter):
+            # print(f"Iteration {i+1}")
+            # Backward Filtering
+            np.copyto(xibxt, self.xibxt_N)
+            np.copyto(Wbxt, self.Wbxt_N)
+            for n in range(self.n_cstrs - 1, -1, -1):
+                np.copyto(en_xibxtn[n], xibxt[n])
+                np.copyto(Wbxtn_en[n], Wbxt[n])
+                H = np.divide(
+                    self.Vfut[n], 1 + self.Vfut[n] * Wbxt[n, n]
+                ).squeeze()
+                h = np.divide(
+                    self.mfut[n] + self.Vfut[n] * xibxt[n],
+                    1 + self.Vfut[n] * Wbxt[n, n],
+                ).squeeze()
+                xibxt -= h * Wbxt[n]
+                Wbxt -= H * np.outer(Wbxt[n], Wbxt[n])
             
-            for i in range(n_iter):
-                # print(f"Iteration {i+1}")
-                # Backward Filtering
-                np.copyto(xibxt, self.xibxt_N)
-                np.copyto(Wbxt, self.Wbxt_N)
-                for n in range(self.n_cstrs - 1, -1, -1):
-                    np.copyto(en_xibxtn[n], xibxt[n])
-                    np.copyto(Wbxtn_en[n], Wbxt[n])
-                    H = np.divide(
-                        self.Vfut[n], 1 + self.Vfut[n] * Wbxt[n, n]
+            # print(f"\txibxt = {xibxt}")
+
+            # Forward Deciding
+            self.xt.fill(0.0)
+            for n in range(self.n_cstrs):
+                Vbut = 1 / Wbxtn_en[n, n]
+                mbut = (
+                    Vbut
+                    * (
+                        en_xibxtn[n] - np.inner(Wbxtn_en[n], self.xt)
                     ).squeeze()
-                    h = np.divide(
-                        self.mfut[n] + self.Vfut[n] * xibxt[n],
-                        1 + self.Vfut[n] * Wbxt[n, n],
-                    ).squeeze()
-                    xibxt -= h * Wbxt[n]
-                    Wbxt -= H * np.outer(Wbxt[n], Wbxt[n])
-                
-                # print(f"\txibxt = {xibxt}")
-
-                # Forward Deciding
-                self.xt.fill(0.0)
-                for n in range(self.n_cstrs):
-                    Vbut = 1 / Wbxtn_en[n, n]
-                    mbut = (
-                        Vbut
-                        * (
-                            en_xibxtn[n] - np.inner(Wbxtn_en[n], self.xt)
-                        ).squeeze()
-                    )
-                    self.beta[n] = np.maximum(
-                        self.beta[n], -mbut / Vbut
-                    )  # enforce utn >= 0
-                    utn = np.clip(mbut, 0.0, None)  # cf. Table 2 in LiLoeliger2024
-                    self.xt[n] += utn
-                    self.mfut[n] = np.abs(utn)  # cf. Table 1 in LiLoeliger2024
-                    self.Vfut[n] = (
-                        2 * self.mfut[n] / self.beta[n]
-                    )  # cf. Table 1 in LiLoeliger2024
+                )
+                self.beta[n] = np.maximum(
+                    self.beta[n], -mbut / Vbut
+                )  # enforce utn >= 0
+                utn = np.clip(mbut, 0.0, None)  # cf. Table 2 in LiLoeliger2024
+                self.xt[n] += utn
+                self.mfut[n] = np.abs(utn)  # cf. Table 1 in LiLoeliger2024
+                self.Vfut[n] = (
+                    2 * self.mfut[n] / self.beta[n]
+                )  # cf. Table 1 in LiLoeliger2024
 
 
-                self.x = -self.xt @ self.A
-                self.cost = np.linalg.norm(self.x).astype(np.float64)
-    
-                # print(f"\tPrimal cost = {self.cost:.6f}")
-                # print(f"\tPrimal solution = {self.x}")
-                # print(f"\tDual cost = {self.dual_cost():.6f}")
-                # print(f"\tDual solution = {self.xt}")
-                # print(f"\tBeta = {self.beta}")
-                # print()
+            self.x = -self.xt @ self.A
+            self.cost = np.linalg.norm(self.x).astype(np.float64)
 
-                if np.any(np.abs(self.cost - cost_buf) < conv_tol):
-                # if np.any(np.all(np.abs(self.xt - xt_buf) < conv_tol, axis=1)):
-                    print(f"Converged after {i+1} iterations")
-                    # self.x = -self.xt @ self.A
-                    max_violation = self.max_violation()
-                    if max_violation <= feas_tol:
-                        # self.cost = np.linalg.norm(self.x).astype(np.float64)
-                        print(f"Feasible solution found with cost {self.cost}.")
-                        return 1
-                    else:
-                        self.cost = np.inf
-                        print(f"Primal problem is infeasible, maximum violation is {max_violation}.")
-                        return -1
+            if np.any(np.abs(self.cost - cost_buf) < conv_tol):
+                print(f"Converged after {i+1} iterations")
+                max_violation = self.max_violation()
+                if max_violation <= feas_tol:
+                    print(f"Feasible solution found with cost {self.cost}.")
+                    return 1
+                else:
+                    self.cost = np.inf
+                    print(f"Primal problem is infeasible, maximum violation is {max_violation}.")
+                    return -1
 
-                cost_buf = np.append(cost_buf[1:], self.cost)
-                # xt_buf = np.vstack((xt_buf[1:], np.copy(self.xt)))
+            cost_buf = np.append(cost_buf[1:], self.cost)
 
-                # prev_cost = self.cost
-
-            print("Reached maximum number of coordinate descents.")
-            return 0
-        else:
-            self.cost = 0.0
-            self.x = np.zeros(self.n_vars, dtype=np.float64)
-            print("Feasible (trivial) solution found.")
-            return 1
+        print("Reached maximum number of coordinate descents.")
+        return 0
 
     def max_violation(self) -> float:
         """
@@ -474,7 +453,7 @@ class Neuron:
             raise ValueError(f"dzmin must be positive, got {dzmin}.")
 
         n_in_channels = np.max(in_channels, initial=-1) + 1
-        self.solver.reset(n_in_channels)
+        self.solver.__init__(n_in_channels)
         self.weight = np.zeros(n_in_channels, dtype=np.float64)
 
         if f_times.size > 0:
@@ -625,7 +604,8 @@ class Neuron:
         feas_tol: float = 1e-3,
         conv_tol: float = 1e-6,
         n_cstrs: int = 1000,
-        n_dcd_iter: int = 10000,
+        n_iter: int = 10000,
+        order: int = 2,
     ) -> int:
         """Learn the synaptic weights to produce the desired firing times when fed with the prescribed input spikes.
 
@@ -645,11 +625,11 @@ class Neuron:
             # 1.1 dual coordinate descent step in the dual space
             # 1.2 convert the dual vector to a primal vector
             # 1.3 compute the cost of the primal vector
-            res_dcd = self.solver.dbffd(
-                feas_tol, conv_tol, n_dcd_iter
+            res = self.solver.solve(
+                feas_tol, conv_tol, n_iter, order=order
             )
-            if res_dcd < 1:
-                return res_dcd
+            if res < 1:
+                return res
 
             # 2. Refine constraints based on the current primal solution. If no constraints are violated, then the primal solution is optimal.
             res_refine = self.refine_constraints(feas_tol)
