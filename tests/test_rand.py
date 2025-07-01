@@ -1,25 +1,5 @@
 from rsnn.rand import *
-
-
-def is_valid_f_times(f_times: np.ndarray, period: float=np.inf) -> bool:
-    """
-    Returns a boolean indicating whether the firing times satisfy the refractory condition.
-
-    Args:
-        f_times (np.ndarray): the firing_times
-        period (float): the cycle period. For non-periodic spike trains, use np.inf (default).
-
-    Returns:
-        (bool): the boolean indicating satisfaction of the refractory condition.
-    """
-    if f_times.size > 1:
-        sorted_f_times = np.sort(f_times)
-        isi = np.diff(sorted_f_times, append=sorted_f_times[0] + period)
-        return bool(np.all(isi >= REFRACTORY_PERIOD))
-    elif f_times.size == 1:
-        return period > REFRACTORY_PERIOD
-    else:
-        return True
+from rsnn.utils import is_valid_f_times
 
 
 def n_incoming(

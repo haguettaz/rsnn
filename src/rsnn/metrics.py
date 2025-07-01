@@ -7,6 +7,7 @@ import numpy.typing as npt
 from scipy.fftpack import shift
 
 from rsnn.constants import REFRACTORY_PERIOD
+from rsnn.utils import are_valid_f_times
 
 
 def score(
@@ -33,14 +34,28 @@ def score(
         * weights[imin:imax],
     )
 
-@dataclass
+
 class SimilarityMetric:
     """
     A class to measure the similarity of a multi-channel spike train with a reference.
     """
 
-    period: float = np.inf
-    r_f_times: List[npt.NDArray[np.float64]] = field(default_factory=list)
+    def __init__(
+        self, r_f_times: List[npt.NDArray[np.float64]], period: float = np.inf
+    ):
+        """
+        Initializes the SimilarityMetric with reference firing times and a period.
+
+        Args:
+            r_f_times (List[npt.NDArray[np.float64]]): The reference firing times for each channel.
+            period (float): The cycle period. For non-periodic spike trains, use np.inf (default).
+        """
+        if not are_valid_f_times(r_f_times, period):
+            raise ValueError(
+                "The reference firing times do not satisfy the refractory condition."
+            )
+        self.r_f_times = r_f_times
+        self.period = period
 
     def measure(self, f_times: List[npt.NDArray[np.float64]]) -> Tuple[float, float]:
         """
@@ -49,13 +64,21 @@ class SimilarityMetric:
         Args:
             f_times (List[npt.NDArray[np.float64]]): The firing times to compare against the reference.
 
+        Raises:
+            ValueError: If the number of channels in the reference and the firing times do not match
+                        or if the firing times do not satisfy the refractory condition.
+
         Returns:
-            float: The precision score.
-            float: The recall score.
+            Tuple[float, float]: A tuple containing the precision and recall scores.
         """
         if len(self.r_f_times) != len(f_times):
             raise ValueError(
                 "The number of channels in the reference and the firing times must match."
+            )
+
+        if not are_valid_f_times(f_times, self.period):
+            raise ValueError(
+                "The firing times do not satisfy the refractory condition."
             )
 
         # dist = [(r_f_times_n[np.newaxis, :] - f_times_n[:, np.newaxis]).reshape(-1) for (r_f_times_n, f_times_n) in zip(self.r_f_times, f_times)]
@@ -120,7 +143,9 @@ class SimilarityMetric:
         p_weights = p_weights[ids]
         r_weights = r_weights[ids]
 
-        precision = max([score(dists, p_weights, shift) for shift in dists], default=0.0)
+        precision = max(
+            [score(dists, p_weights, shift) for shift in dists], default=0.0
+        )
         recall = max([score(dists, r_weights, shift) for shift in dists], default=0.0)
 
         return precision, recall

@@ -155,19 +155,19 @@ class Solver:
                 - -1 if the optimization failed to find a feasible solution.
         """
 
-        if self.n_cstrs > 0:
-            if order == 2:
-                return self.dbffd(feas_tol, conv_tol, n_iter)
-            elif order == 1:
-                return self.dpcd(feas_tol, conv_tol, n_iter)
-            else:
-                raise ValueError(f"Unsupported order {order}. Supported orders are 1 (=projected dual coordinate descent) and 2 (=backward filtering forward deciding).")
-            
+        # if self.n_cstrs > 0:
+        if order == 2:
+            return self.dbffd(feas_tol, conv_tol, n_iter)
+        elif order == 1:
+            return self.dpcd(feas_tol, conv_tol, n_iter)
         else:
-            self.cost = 0.0
-            self.x = np.zeros(self.n_vars, dtype=np.float64)
-            print("Feasible (trivial) solution found.")
-            return 1
+            raise ValueError(f"Unsupported order {order}. Supported orders are 1 (=projected dual coordinate descent) and 2 (=backward filtering forward deciding).")
+            
+        # else:
+        #     self.cost = 0.0
+        #     self.x = np.zeros(self.n_vars, dtype=np.float64)
+        #     print("Feasible (trivial) solution found.")
+        #     return 1
 
     def dpcd(self, feas_tol: float=1e-6, conv_tol: float=1e-6, n_iter: int=1000) -> int:
         """
@@ -265,8 +265,6 @@ class Solver:
                 xibxt -= h * Wbxt[n]
                 Wbxt -= H * np.outer(Wbxt[n], Wbxt[n])
             
-            # print(f"\txibxt = {xibxt}")
-
             # Forward Deciding
             self.xt.fill(0.0)
             for n in range(self.n_cstrs):
@@ -314,7 +312,7 @@ class Solver:
         Returns:
             bool: True if the solution is valid, False otherwise.
         """
-        return np.max(np.clip(self.A @ self.x - self.b, 0.0, None))
+        return np.max(np.clip(self.A @ self.x - self.b, 0.0, None), initial=0.0)
 
     def add_constraint(
         self,

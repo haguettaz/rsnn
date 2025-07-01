@@ -140,6 +140,125 @@ def test_solver_dbffd():
         solver.cost
     )  # Cost should be positive infinity for infeasibility
 
+
+
+def test_solver_dpcd():
+    # Initialize the solver
+    solver = Solver(10)
+    assert solver.n_vars == 10
+    assert solver.n_cstrs == 0
+
+    status = solver.dpcd()
+    assert status == 1
+
+    # Add a few linear constraints a x <= b
+    solver.add_constraint(
+        np.array(
+            [
+                -0.35793998,
+                -0.27761938,
+                -0.0408258,
+                -0.12746512,
+                -0.3404259,
+                -0.81376922,
+                -0.30628137,
+                -0.48007243,
+                0.02302248,
+                0.24069189,
+            ]
+        ),
+        np.array(0.50860874),
+    )
+    solver.add_constraint(
+        np.array(
+            [
+                0.57031823,
+                0.41957217,
+                0.62768923,
+                -0.48580253,
+                -0.14281048,
+                -0.12147438,
+                0.65654433,
+                0.45457545,
+                0.23564731,
+                -0.1224626,
+            ]
+        ),
+        np.array(1.003075),
+    )
+    solver.add_constraint(
+        np.array(
+            [
+                0.3951132,
+                -0.15796504,
+                0.81129171,
+                -0.75362291,
+                0.7669671,
+                0.76668151,
+                -0.33074134,
+                0.29926723,
+                -0.73339186,
+                0.8264834,
+            ]
+        ),
+        np.array(-1.62390705),
+    )
+    solver.add_constraint(
+        np.array(
+            [
+                -0.93735882,
+                0.19003541,
+                -0.3478004,
+                -0.06509792,
+                -0.3212192,
+                -0.01530734,
+                -0.91639121,
+                0.5778128,
+                -0.18541728,
+                -0.46247663,
+            ],
+        ),
+        np.array(-1.5753577),
+    )
+    assert solver.n_vars == 10
+    assert solver.n_cstrs == 4
+
+    status = solver.dpcd()
+    assert status is 1
+    assert np.isclose(
+        solver.cost, 1.4293642842883392
+    )  # Check if the cost is below the tolerance
+    assert np.allclose(
+        solver.x,
+        np.array(
+            [
+                0.49443406,
+                -0.05898912,
+                -0.16868494,
+                0.44813251,
+                -0.16515933,
+                -0.39468335,
+                0.86323825,
+                -0.59236274,
+                0.52774889,
+                -0.09063558,
+            ]
+        ),
+    )
+    assert np.all(solver.A @ solver.x - solver.b <= 1e-6)
+
+    # Add a new constraint to the solver, which makes the problem infeasible
+    solver.add_constraint(-solver.A[0], -solver.b[0] - 0.1)
+    assert solver.n_vars == 10
+    assert solver.n_cstrs == 5
+
+    # Perform dual coordinate descent
+    status = solver.dpcd()
+    assert status == -1  # Status should be -1 for infeasibility
+    assert np.isposinf(
+        solver.cost
+    )  # Cost should be positive infinity for infeasibility
+
 def test_neuron_init_solver():
     np.random.seed(42)  # For reproducibility
     
@@ -164,13 +283,10 @@ def test_neuron_init_solver():
 
 
 def test_neuron_learn():
-    import time
-
     np.random.seed(42)  # For reproducibility
     
     neuron = Neuron()
 
-    # firing times are separated by at least 1 time unit
     f_times = np.sort(np.random.uniform(0.0, 90.0, size=10))
     f_times += np.arange(10)
 
