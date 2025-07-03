@@ -7,7 +7,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.special import lambertw
 
-from rsnn.core.optim import Solver
+from rsnn.core.optim import QProgram
 
 FIRING_THRESHOLD = 1.0
 REFRACTORY_RESET = -1.0
@@ -179,7 +179,7 @@ class Neuron:
         # Contains both information for potential and derivatives
 
         # Add constraints at firing times
-        solver = Solver(n_in_channels)
+        solver = QProgram(n_in_channels)
 
         in_coef, starts, durations, bounds = [], [], [], []
         for n in range(f_times.size):

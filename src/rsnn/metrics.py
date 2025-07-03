@@ -1,3 +1,4 @@
+import warnings
 from dataclasses import dataclass, field
 from math import dist
 from typing import List, Tuple
@@ -57,7 +58,9 @@ class SimilarityMetric:
         self.r_f_times = r_f_times
         self.period = period
 
-    def measure(self, f_times: List[npt.NDArray[np.float64]]) -> Tuple[float, float]:
+    def measure(
+        self, f_times: List[npt.NDArray[np.float64]]
+    ) -> Tuple[float | np.float64, float | np.float64]:
         """
         Computes the similarity between the reference firing times and the provided firing times.
 
@@ -69,7 +72,7 @@ class SimilarityMetric:
                         or if the firing times do not satisfy the refractory condition.
 
         Returns:
-            Tuple[float, float]: A tuple containing the precision and recall scores.
+            Tuple[float | np.float64, float | np.float64]: A tuple containing the precision and recall scores.
         """
         if len(self.r_f_times) != len(f_times):
             raise ValueError(
@@ -77,9 +80,10 @@ class SimilarityMetric:
             )
 
         if not are_valid_f_times(f_times, self.period):
-            raise ValueError(
-                "The firing times do not satisfy the refractory condition."
+            warnings.warn(
+                "The firing times do not satisfy the refractory condition.", UserWarning
             )
+            return (np.nan, np.nan)
 
         # dist = [(r_f_times_n[np.newaxis, :] - f_times_n[:, np.newaxis]).reshape(-1) for (r_f_times_n, f_times_n) in zip(self.r_f_times, f_times)]
 

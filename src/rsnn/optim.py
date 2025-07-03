@@ -1,10 +1,29 @@
+import logging
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
+import gurobipy as gp
 import numpy as np
 import numpy.typing as npt
 
 from rsnn.constants import *
+
+logger = logging.getLogger(__name__)
+logger.setLevel("DEBUG")
+formatter = logging.Formatter(
+    "%(asctime)s.%(msecs)03d' - %(levelname)s - %(message)s",
+    style="%",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+console_handler.setLevel("DEBUG")
+logger.addHandler(console_handler)
+
+file_handler = logging.FileHandler("app.log", mode="a", encoding="utf-8")
+file_handler.setFormatter(formatter)
+file_handler.setLevel("INFO")
+logger.addHandler(file_handler)
 
 
 def compute_ck(
@@ -18,9 +37,6 @@ def compute_ck(
     reset: (
         float | np.float64 | npt.NDArray[np.float64]
     ) = REFRACTORY_RESET,  # initial value (at start time)
-    # offset: (
-    #     float | np.float64 | npt.NDArray[np.float64]
-    # ) = 0.0,  # offset to apply to start times
 ) -> Tuple[
     npt.NDArray[np.float64],  # start: shape (n_intervals)
     npt.NDArray[np.float64],  # length: shape (n_intervals)
@@ -87,157 +103,342 @@ def compute_ck(
         ck0[n + 1] += (ck0[n] + ck1[n] * length[n]) * np.exp(-length[n])
         ck1[n + 1] += ck1[n] * np.exp(-length[n])
 
+    # logger.debug(
+    #     f"The time interval [{start[0]}, {start[-1] + length[-1]}) has been partitioned into {start.size} intervals."
+    # )
+
     return start, length, ck0, ck1
 
 
-def find_maximum(
+def find_maximum_violation(
     c0: npt.NDArray[np.float64],
     c1: npt.NDArray[np.float64],
     length: npt.NDArray[np.float64],
     lim: npt.NDArray[np.float64],
-) -> Tuple[np.intp, np.float64, np.float64]:
-    # coef and ends are assumed to be non-empty (otherwise, this is an unconstrained problem)
-    # for derivatives, adapt coef and zmax accordingly
-    # the intervals of interest are defined by the ends array, the intervals are (0, ends)
-    # it has shape (n_intervals)
-    # in_coef should only contain the coefficients for the intervals of interest
-    # it has shape (2, n_inputs, n_intervals) with dtype np.float32
-    # both in_coef and ends are constant
+) -> Optional[Tuple[np.float64, np.intp, np.float64]]:
+    """
+    Compute the maximum violation of the condition c0[n] + c1[n] * dt * exp(-dt) > lim[n] for 0 <= dt < length[n] for each interval n, if any.
 
-    # ignore the RuntimeWarning due to division by zero
-    ts = np.where(c1 <= 0, 0.0, np.clip(1 - c0 / c1, 0.0, length))
-    vs = (c0 + c1 * ts) * np.exp(-ts) - lim
-    imax = np.argmax(vs)
+    Args:
+        c0 (npt.NDArray[np.float64]): the 0th coefficients for each interval.
+        c1 (npt.NDArray[np.float64]): the 1st coefficients for each interval.
+        length (npt.NDArray[np.float64]): the length for each interval.
+        lim (npt.NDArray[np.float64]): the maximum allowed value for each interval.
 
-    return imax, vs[imax], ts[imax]
+    Returns:
+        Tuple[np.float64, np.intp, np.float64]: the maximum violation and the interval index nmax and the time difference dt in [0, length_nmax] at which the violation occurs.
+    """
+    dt = np.vstack(
+        [np.zeros_like(c0), np.clip(1 - c0 / c1, 0.0, length), length]
+    )  # shape (3, n_intervals)
+    dv = np.clip(
+        np.nan_to_num(c0[np.newaxis, :] + c1[np.newaxis, :] * dt) * np.exp(-dt)
+        - lim[np.newaxis, :],
+        0.0,
+        None,
+    )  # shape (3, n_intervals)
+    imax = np.unravel_index(
+        np.argmax(dv), dv.shape
+    )  # index tuple of the maximum value in v
+
+    if dv[imax] > 0.0:
+        # logger.debug(
+        #     f"Maximum violation (with value {dv[imax]}) found for the {imax[0]}th interval at dt = {dt[imax]}."
+        # )
+        return dv[imax], imax[1], dt[imax]
+
+    # logger.debug("No violation found.")
+    return None
 
 
-class Solver:
+class QProgram:
     def __init__(
         self,
-        n_vars: int | np.intp,
+        n_vars: int,
+        mxf: Optional[npt.NDArray[np.float64]] = None,
+        Vxf: Optional[npt.NDArray[np.float64]] = None,
+        beta_init: float | np.float64 = 1e-12,  # initial value for beta
     ):
         """
-        Initialize the solver with parameters.
+        Initialize a solver for quadratic optimization problems with linear constraints.
 
-        Parameters:
+        Args:
+            n_vars (int | np.intp): Number of variables in the optimization problem.
+            mxf (Optional[npt.NDArray[np.float64]]): Mean vector for the primal cost. If None, defaults to a zero vector.
+            Vxf (Optional[npt.NDArray[np.float64]]): Covariance matrix for the primal cost. If None, defaults to an identity matrix.
+            beta_init (float | np.float64): Initial value for the beta parameter used in the optimization. Defaults to 1e-12.
+
+        Raises:
+            ValueError: If the shapes of `mxf` and `Vxf` do not match the expected dimensions.
         """
+        if mxf is not None and mxf.shape != (n_vars,):
+            raise ValueError(
+                f"If provided, mxf must have shape ({n_vars},) but has shape {mxf.shape}."
+            )
+        if Vxf is not None and Vxf.shape != (n_vars, n_vars):
+            raise ValueError(
+                f"If provided, Vxf must have shape ({n_vars},{n_vars}) but has shape {Vxf.shape}."
+            )
+
         self.n_vars = n_vars  # Number of variables
         self.n_cstrs = 0  # Number of constraints (= number of dual variables)
 
+        self.Vxf = Vxf
+        self.Wxf = None if self.Vxf is None else np.linalg.inv(self.Vxf)
+        self.mxf = mxf
+        self.xixf = (
+            None
+            if self.mxf is None
+            else self.mxf if self.Wxf is None else self.Wxf @ self.mxf
+        )
+
+        self.A = np.empty((self.n_cstrs, n_vars))
+        self.b = np.empty((self.n_cstrs,))
+
         self.x = np.zeros(self.n_vars, dtype=np.float64)
         self.xt = np.zeros(self.n_cstrs, dtype=np.float64)
-        self.cost = 0.0
 
-        self.A = np.empty((0, n_vars))
-        self.b = np.empty((0,))
-
-        self.xibxt_N = np.empty((0,))
-        self.Wbxt_N = np.empty((0, 0), dtype=np.float64)
+        self.xibxt_N = np.empty((self.n_cstrs,))
+        self.Wbxt_N = np.empty((self.n_cstrs, self.n_cstrs), dtype=np.float64)
 
         self.mfut = np.zeros((self.n_cstrs,))
         self.Vfut = np.zeros((self.n_cstrs,))
-        self.beta = np.full((self.n_cstrs,), 1e-12)
 
-    def solve(self, feas_tol: float=1e-6, conv_tol: float=1e-6, n_iter: int=1000, order:int | np.intp=2) -> int:
+        self.beta_init = beta_init
+        self.beta = np.full((self.n_cstrs,), self.beta_init)
+
+        self.is_feas = True  # whether the problem is feasible
+        self.dual_cost = 0.0
+        self.primal_cost = 0.0  # without any constraints, the cost is 0.0
+        self.duality_gap = self.dual_cost - self.primal_cost
+        # self.dual_residual = np.zeros(self.n_vars, dtype=np.float64)
+        self.primal_residual = np.zeros(self.n_cstrs, dtype=np.float64)
+
+        # Initialize a Gurobi model for feasibility checking
+        # self.gb_env = gp.Env(empty=True)
+        # self.gb_env.setParam("OutputFlag", 0)  # Suppress Gurobi output
+        self.gb_model = gp.Model("qp_model")
+        self.gb_model.setParam("OutputFlag", 0)  # Suppress Gurobi output
+        self.gb_x = self.gb_model.addMVar(self.n_vars, name="x")
+        # self.gb_s = self.gb_model.addVar(name="s")
+        # self.gb_model.setObjective(self.gb_s, gp.GRB.MINIMIZE)
+
+        logger.info(
+            f"Quadratic program initialized with {self.n_vars} variables (and {self.n_cstrs} constraints)."
+        )
+
+    def add_constraints(
+        self,
+        A: npt.NDArray[np.float64],  # shape (n_cstrs, n_vars) or (n_vars, )
+        b: npt.NDArray[np.float64],  # shape (n_cstrs, 1) or (n_cstrs, )
+        # check_feas:bool = True,  # whether to check feasibility before adding constraints
+    ):
+        """
+        Add linear inequality constraints to the optimization problem.
+
+        The constraints are of the form A @ x <= b, where each row represents one constraint.
+        The method validates constraint dimensions, checks feasibility using Gurobi, and updates
+        internal matrices and vectors accordingly.
+
+        Args:
+            A (npt.NDArray[np.float64]): Constraint coefficient matrix with shape (n_new_constraints, n_vars)
+            or (n_vars,) for a single constraint.
+            b (npt.NDArray[np.float64]): Right-hand side vector with shape (n_new_constraints,)
+            or scalar for a single constraint.
+
+        Raises:
+            ValueError: If A and b have incompatible dimensions with the problem variables.
+
+        Note:
+            After adding constraints, the problem's feasibility is automatically checked.
+            If infeasible, subsequent solve() calls will return -1.
+        """
+        A = np.atleast_2d(A)
+        if A.shape != (b.size, self.n_vars):
+            raise ValueError(
+                f"A must have shape ({b.size}, {self.n_vars}) but has shape {A.shape}."
+            )
+
+        # self.gb_model.addConstr(A @ self.gb_x - self.gb_s <= b, name="constraints")
+        self.gb_model.addConstr(A @ self.gb_x <= b, name="leq")
+        self.gb_model.setObjective(
+            0.0, gp.GRB.MINIMIZE
+        )  # Objective is zero for feasibility check
+        self.gb_model.optimize()
+        if self.gb_model.status == gp.GRB.OPTIMAL:
+            self.is_feas = True
+            logger.info("The problem is feasible.")
+        else:
+            self.is_feas = False
+            logger.info("The problem is not feasible.")
+
+        self.n_cstrs += b.size
+
+        self.xt = np.append(self.xt, np.zeros_like(b))
+
+        self.Wbxt_N = np.block([[self.Wbxt_N, self.A @ A.T], [A @ self.A.T, A @ A.T]])
+        self.xibxt_N = np.append(self.xibxt_N, -b)
+
+        self.mfut = np.append(self.mfut, np.zeros_like(b))
+        self.Vfut = np.append(self.Vfut, np.zeros_like(b))
+        self.beta = np.append(self.beta, np.full_like(b, self.beta_init))
+
+        self.A = np.vstack((self.A, A))
+        self.b = np.append(self.b, b)
+
+        logger.debug(
+            f"{b.size} new constraint(s) successfully added. The problem now has {self.n_cstrs} constraints."
+        )
+
+        self.primal_cost = np.nan
+        self.dual_cost = np.nan
+        self.primal_residual = np.nan
+        # self.dual_residual = np.nan
+
+    def analyze_constraints(self) -> npt.NDArray[np.float64]:
+        gb_model = gp.Model("analyze_constraints")
+        gb_model.setParam("OutputFlag", 0)  # Suppress Gurobi output
+
+        # Add variables for the Gurobi model
+        gb_x = gb_model.addMVar(self.n_vars, name="x")
+        gb_s = gb_model.addMVar(self.n_cstrs, lb=0.0, name="s")
+
+        # Add constraints to the Gurobi model
+        gb_model.addConstr(self.A @ gb_x <= self.b + gb_s, name="leq_with_slack")
+
+        # Add the objective function to minimize the slack variables
+        gb_model.setObjective(gb_s.sum(), gp.GRB.MINIMIZE)
+
+        # Optimize the Gurobi model
+        gb_model.optimize()
+
+        if gb_model.status == gp.GRB.OPTIMAL:
+            logger.info("Constraints analysis completed successfully.")
+            return np.array(gb_s.X)
+
+        return np.full(self.n_cstrs, np.nan, dtype=np.float64)
+
+    def solve(
+        self,
+        n_iter: int = 1000,
+        atol: float = 1e-9,  # absolute tolerance for convergence
+    ) -> int:
         """
         Solve the optimization problem defined by the constraints in the dual space.
 
         Args:
-            feas_tol (float): Tolerance for feasibility.
-            conv_tol (float): Tolerance for convergence.
-            n_iter (int): Maximum number of iterations to run.
+            n_iter (int): Maximum number of iterations allowed to converge to a solution.
+            atol (float): Absolute tolerance for convergence. The optimization is considered converged if the dual cost and primal cost are within this tolerance. After convergence, the solution is guaranteed to be atol-suboptimal.
+            assume_feas (bool): Whether to assume the problem is feasible. If True, the solver will not check for feasibility and will directly attempt to solve the problem. If False, it will check for feasibility before solving.
 
         Returns:
             int: The status of the optimization:
-                - 1 if the optimization converged to a solution,
-                - 0 if the optimization failed to converge,
-                - -1 if the optimization failed to find a feasible solution.
+                - 1 if the optimization converged to a solution.
+                - 0 if the optimization failed to converge or another unexpected issue occurred.
+                - -1 if the optimization problem is not feasible.
         """
 
-        # if self.n_cstrs > 0:
-        if order == 2:
-            return self.dbffd(feas_tol, conv_tol, n_iter)
-        elif order == 1:
-            return self.dpcd(feas_tol, conv_tol, n_iter)
+        # logger.info(
+        #     f"The quadratic problem has {self.n_cstrs} constraints for {self.n_vars} variables."
+        # )
+        if not self.is_feas:
+            logger.info("The problem is not feasible.")
+            return -1
+
+        if self.n_vars > self.n_cstrs:
+            logger.info(
+                f"The problem is underdetermined ({self.n_vars} variables and {self.n_cstrs} constraints)."
+            )
+            logger.info(
+                "Attempt to solve the problem via Backward-Filtering Forward-Deciding in the Dual Space (DBFFD)."
+            )
+
+            return self.dbffd(n_iter, atol)
+
         else:
-            raise ValueError(f"Unsupported order {order}. Supported orders are 1 (=projected dual coordinate descent) and 2 (=backward filtering forward deciding).")
-            
-        # else:
-        #     self.cost = 0.0
-        #     self.x = np.zeros(self.n_vars, dtype=np.float64)
-        #     print("Feasible (trivial) solution found.")
-        #     return 1
+            logger.info(
+                f"The problem is overdetermined ({self.n_vars} variables and {self.n_cstrs} constraints)."
+            )
+            logger.info("Attempt to solve the problem with Gurobi.")
 
-    def dpcd(self, feas_tol: float=1e-6, conv_tol: float=1e-6, n_iter: int=1000) -> int:
-        """
-        Dual projected coordinate descent algorithm.
-        This updates the dual solution vector xt based on the current constraints.
+            cost = (
+                self.gb_x.T @ self.gb_x / 2.0
+                if self.Wxf is None
+                else self.gb_x.T @ (self.Wxf @ self.gb_x) / 2.0
+            ) + (0.0 if self.xixf is None else -self.xixf @ self.gb_x)
+            self.gb_model.setObjective(cost, gp.GRB.MINIMIZE)
 
-        Returns:
-            (int): the status of the optimization:
-                - 1 if the optimization converged to a solution,
-                - 0 if the optimization failed to converge,
-                - -1 if the optimization failed to find a feasible solution.
+            self.gb_model.optimize()
 
-        """
-        en_xibxtn = np.empty((self.n_cstrs, 1))
+            if self.gb_model.status == gp.GRB.OPTIMAL:
+                logger.info(f"Optimal solution found with cost {self.gb_model.objVal}.")
+                self.x = np.array(self.gb_x)
+                self.primal_cost = self.gb_model.objVal
 
-        xibxt = np.empty((self.n_cstrs,))
+                return 1
 
-        cost_buf = np.full((2,), np.inf)
-        
-        for i in range(n_iter):
-            # Backward Filtering
-            np.copyto(xibxt, self.xibxt_N)
-            for n in range(self.n_cstrs - 1, -1, -1):
-                np.copyto(en_xibxtn[n], xibxt[n])
-                xibxt -= self.mfut[n] * self.Wbxt_N[n]
-            
-            # Forward Deciding
-            self.xt.fill(0.0)
-            for n in range(self.n_cstrs):
-                Vbut = 1 / self.Wbxt_N[n, n]
-                mbut = (
-                    Vbut
-                    * (
-                        en_xibxtn[n] - np.inner(self.Wbxt_N[n], self.xt)
-                    ).squeeze()
+            else:
+                logger.info(
+                    f"Failed to find an optimal solution. Gurobi status: {self.gb_model.status}."
                 )
-                utn = np.clip(mbut, 0.0, None)  # cf. Table 2 in LiLoeliger2024
-                self.xt[n] += utn
-                self.mfut[n] = np.abs(utn)  # cf. Table 1 in LiLoeliger2024
+                self.x.fill(np.nan)
+                self.primal_cost = np.nan
+                self.dual_cost = np.nan
+                self.duality_gap = np.nan
+                self.xt.fill(np.nan)
 
-            self.x = -self.xt @ self.A
-            self.cost = np.linalg.norm(self.x).astype(np.float64)
-            
-            if np.any(np.abs(self.cost - cost_buf) < conv_tol):
-                print(f"Converged after {i+1} iterations")
-                max_violation = self.max_violation()
-                if max_violation <= feas_tol:
-                    print(f"Feasible solution found with cost {self.cost}.")
-                    return 1
-                else:
-                    self.cost = np.inf
-                    print(f"Primal problem is infeasible, maximum violation is {max_violation}.")
-                    return -1
+                return 0
 
-            cost_buf = np.append(cost_buf[1:], self.cost)
+    def update_primal_cost(self):
+        """
+        Update the primal cost based on the current solution.
+        """
+        self.primal_cost = (
+            np.inner(self.x, self.x) / 2.0
+            if self.Wxf is None
+            else np.inner(self.x, self.Wxf @ self.x) / 2.0
+        ) + (0.0 if self.xixf is None else -np.inner(self.x, self.xixf))
 
-        print("Reached maximum number of coordinate descents.")
-        return 0
+    def update_dual_cost(self):
+        """
+        Update the dual cost based on the current solution.
+        """
+        self.dual_cost = (
+            np.inf
+            if np.any(np.isposinf(self.xt))
+            else (
+                np.inner(self.xt, self.xibxt_N)
+                - np.inner(self.xt, self.Wbxt_N @ self.xt) / 2.0
+            )
+        )
 
-    def dbffd(self, feas_tol: float=1e-6, conv_tol: float=1e-6, n_iter: int=1000) -> int:
+    def update_primal_residual(self):
+        """
+        Update the dual residual based on the current solution.
+        """
+        self.primal_residual = np.clip(self.A @ self.x - self.b, 0.0, None)
+
+    def update_primal_solution(self):
+        """
+        Update the primal solution based on the current dual solution.
+        """
+        self.x = (0.0 if self.mxf is None else self.mxf) - (
+            self.A.T @ self.xt if self.Vxf is None else self.Vxf @ self.A.T @ self.xt
+        )
+
+    def dbffd(
+        self,
+        n_iter: int = 1000,
+        atol: float = 1e-9,  # relative tolerance for convergence
+    ) -> int:
         """
         Run backward-filtering forward-deciding in the dual space to optimize the dual solution.
         This updates the dual solution vector xt based on the current constraints.
 
         Returns:
             (int): the status of the optimization:
-                - 1 if the optimization converged to a solution,
-                - 0 if the optimization failed to converge,
-                - -1 if the optimization failed to find a feasible solution.
-
+                - 1 if the optimization converged to a solution.
+                - 0 if the optimization failed to converge within the maximum number of iterations.
         """
         en_xibxtn = np.empty((self.n_cstrs, 1))
         Wbxtn_en = np.empty((self.n_cstrs, self.n_cstrs))
@@ -245,114 +446,140 @@ class Solver:
         xibxt = np.empty((self.n_cstrs,))
         Wbxt = np.empty((self.n_cstrs, self.n_cstrs))
 
-        cost_buf = np.full((2,), np.inf)
-        
+        # logger.debug(
+        #     f"Starting DBFFD with {self.n_cstrs} constraints and {self.n_vars} variables. Previous costs are {self.prev_cost}."
+        # # )
+        # logger.debug(f"{self.xibxt_N=}")
+        # logger.debug(f"{self.Wbxt_N=}")
+
         for i in range(n_iter):
-            # print(f"Iteration {i+1}")
             # Backward Filtering
             np.copyto(xibxt, self.xibxt_N)
             np.copyto(Wbxt, self.Wbxt_N)
+            # logger.debug("Backward Filtering")
             for n in range(self.n_cstrs - 1, -1, -1):
                 np.copyto(en_xibxtn[n], xibxt[n])
                 np.copyto(Wbxtn_en[n], Wbxt[n])
-                H = np.divide(
-                    self.Vfut[n], 1 + self.Vfut[n] * Wbxt[n, n]
-                ).squeeze()
+                H = np.divide(self.Vfut[n], 1 + self.Vfut[n] * Wbxt[n, n]).squeeze()
                 h = np.divide(
                     self.mfut[n] + self.Vfut[n] * xibxt[n],
                     1 + self.Vfut[n] * Wbxt[n, n],
                 ).squeeze()
                 xibxt -= h * Wbxt[n]
                 Wbxt -= H * np.outer(Wbxt[n], Wbxt[n])
-            
+                # logger.debug(f"{n=}")
+                # logger.debug(f"{Wbxt[n, n]=}")
+                # logger.debug(f"{h=}")
+                # logger.debug(f"{H=}")
+
             # Forward Deciding
+            # logger.debug("Forward Deciding")
             self.xt.fill(0.0)
             for n in range(self.n_cstrs):
+                # logger.debug(f"{n=}")
                 Vbut = 1 / Wbxtn_en[n, n]
-                mbut = (
-                    Vbut
-                    * (
-                        en_xibxtn[n] - np.inner(Wbxtn_en[n], self.xt)
-                    ).squeeze()
-                )
+                xibut = (en_xibxtn[n] - np.inner(Wbxtn_en[n], self.xt)).squeeze()
+                # mbut = Vbut * (en_xibxtn[n] - np.inner(Wbxtn_en[n], self.xt)).squeeze() # issue: can currently be nan...
+                mbut = Vbut * xibut  # issue: can currently be nan...
                 self.beta[n] = np.maximum(
-                    self.beta[n], -mbut / Vbut
+                    self.beta[n], -xibut  # is xiut well-defined???
                 )  # enforce utn >= 0
+                # self.beta[n] = np.maximum(
+                #     self.beta[n], -mbut / Vbut # is xiut well-defined???
+                # )  # enforce utn >= 0
+                # logger.debug(f"{en_xibxtn[n]=} and {Wbxtn_en[n]=}")
                 utn = np.clip(mbut, 0.0, None)  # cf. Table 2 in LiLoeliger2024
                 self.xt[n] += utn
                 self.mfut[n] = np.abs(utn)  # cf. Table 1 in LiLoeliger2024
                 self.Vfut[n] = (
                     2 * self.mfut[n] / self.beta[n]
                 )  # cf. Table 1 in LiLoeliger2024
+                # logger.debug(f"{Vbut=} and {mbut=} gives {self.beta[n]=}, {self.mfut[n]=}, and {self.Vfut[n]=}")
 
+            # logger.debug(f"iter {i+1}:\n\t{self.beta=}\n\t{self.mfut=}\n\t{self.Vfut=}")
+            self.update_primal_solution()
+            self.update_dual_cost()
+            # if np.isposinf(self.dual_cost):
+            #     self.primal_cost = np.nan
+            #     self.xt.fill(np.nan)
+            #     self.x.fill(np.nan)
+            #     logger.info(
+            #         f"DBFFD - Dual problem is unbounded, hence the primal problem is infeasible."
+            #     )
+            #     return -1
 
-            self.x = -self.xt @ self.A
-            self.cost = np.linalg.norm(self.x).astype(np.float64)
+            self.update_primal_cost()
+            # self.update_primal_residual()
+            # self.update_dual_residual() # always 0.0 since x is computed from xt
+            logger.debug(
+                f"DBFFD - Iteration {i+1}: dual cost is {self.dual_cost} and primal cost is {self.primal_cost}"
+            )
+            # logger.debug(f"DBFFD - Iteration {i+1}:\n\tdual cost is {self.dual_cost} and primal cost is {self.primal_cost}\n\tnorm of primal residual is {np.linalg.norm(self.primal_residual)}\n\tnorm of dual residual is {np.linalg.norm(self.dual_residual)}")
+            # if np.any(np.isposinf(self.xt)):
 
-            if np.any(np.abs(self.cost - cost_buf) < conv_tol):
-                print(f"Converged after {i+1} iterations")
-                max_violation = self.max_violation()
-                if max_violation <= feas_tol:
-                    print(f"Feasible solution found with cost {self.cost}.")
-                    return 1
-                else:
-                    self.cost = np.inf
-                    print(f"Primal problem is infeasible, maximum violation is {max_violation}.")
-                    return -1
+            # logger.debug(
+            #     f"DBFFD - Iteration {i+1}: primal cost is {self.primal_cost} and dual cost is {self.dual_cost} (duality gap is {self.dual_cost - self.primal_cost}). Maximum violation is {self.max_violation() if self.n_cstrs > 0 else 'N/A'}."
+            # )
+            if np.isclose(self.primal_cost, self.dual_cost, atol=atol):
+                # if np.abs(self.primal_cost - self.dual_cost) < atol:
+                logger.info(
+                    f"DBFFD - Feasible solution found in {i+1} iteration(s) with cost {self.primal_cost}."
+                )
+                return 1
 
-            cost_buf = np.append(cost_buf[1:], self.cost)
+                # logger.info(f"Converged after {i+1} iteration(s).")
+                # max_violation = self.max_violation()
+                # if max_violation <= ftol:
+                #     logger.info(f"Feasible solution found with cost {self.cost}.")
+                #     return 1
+                # else:
+                #     self.cost = np.nan
+                #     logger.info(
+                #         f"Primal problem is infeasible, maximum violation is {max_violation}."
+                #     )
 
-        print("Reached maximum number of coordinate descents.")
+            # if np.any(np.isclose(self.cost, self.prev_cost, atol=conv_tol, atol=1e-12)):
+            #     logger.info(f"Converged after {i+1} iteration(s).")
+            #     max_violation = self.max_violation()
+            #     if max_violation <= ftol:
+            #         logger.info(f"Feasible solution found with cost {self.cost}.")
+            #         return 1
+            #     else:
+            #         self.cost = np.nan
+            #         logger.info(
+            #             f"Primal problem is infeasible, maximum violation is {max_violation}."
+            #         )
+            #         return -1
+
+            # self.prev_cost = np.append(self.prev_cost[1:], self.cost)
+
+        logger.warning(
+            "DBFFD - Failed to converge within the maximum number of iterations. Check feasibility or increase n_iter."
+        )
         return 0
 
-    def max_violation(self) -> float:
-        """
-        Check if the current solution is valid, i.e., if all constraints are satisfied.
+    # def is_valid(self, ftol: np.float64 | float) -> bool | np.bool:
+    #     """
+    #     Check if the current solution is valid, i.e., if all constraints are satisfied.
 
-        Returns:
-            bool: True if the solution is valid, False otherwise.
-        """
-        return np.max(np.clip(self.A @ self.x - self.b, 0.0, None), initial=0.0)
+    #     Args:
+    #         ftol (np.float64 | float): Relative tolerance for feasibility.
 
-    def add_constraint(
-        self,
-        a: npt.NDArray[np.float64],
-        b: npt.NDArray[np.float64],
-    ) -> int:
-        a_norm = np.linalg.norm(a)
+    #     Returns:
+    #         bool: True if the solution is valid, False otherwise.
+    #     """
 
-        if a_norm > 0.0:  # a is not the zero vector
-            self.n_cstrs += 1
+    # ge = self.A @ self.x > self.b
+    # return np.allclose(self.A[ge] @ self.x, self.b[ge], rtol=ftol, atol=1e-12)
 
-            # self.xt = np.append(self.xt, 0.0)
-            self.xt = np.zeros(self.n_cstrs, dtype=np.float64)
+    # def max_violation(self) -> np.float64:
+    #     """
+    #     Compute the maximum violation of the constraints.
 
-            a /= a_norm
-            b /= a_norm
-
-            Aat = (self.A @ a).reshape(-1, 1)
-
-            # self.Vfxt = np.block([[self.Vfxt, Aat], [Aat.T, 1.0]])
-            # self.mfxt = np.append(self.mfxt, -b)
-
-            self.A = np.vstack((self.A, a))
-            self.b = np.append(self.b, b)
-
-            self.xibxt_N = np.append(self.xibxt_N, -b)
-            self.Wbxt_N = np.block([[self.Wbxt_N, Aat], [Aat.T, 1.0]])
-
-            # self.en_xibxtn = np.empty((self.n_cstrs, 1))
-            # self.Wbxtn_en = np.empty((self.n_cstrs, self.n_cstrs))
-            
-            self.mfut = np.append(self.mfut, 0.0)
-            self.Vfut = np.append(self.Vfut, 0.0)
-            self.beta = np.append(self.beta, 1e-12)
-
-            return 0
-        elif b >= 0.0:  # if b >= 0 then ax = 0 <= b for every x
-            return 0
-        else:  # if b < 0 then a x = 0 > b for every x
-            return -1
+    #     Returns:
+    #         np.float64: The maximum violation of the constraints.
+    #     """
+    #     return np.max(np.clip(self.A @ self.x - self.b, 0.0, None), initial=0.0)
 
 
 @dataclass
@@ -361,62 +588,42 @@ class Neuron:
     A class representing a neuron with its input channels.
     """
 
-    # Synaptic weights for each input channel
-    weight: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0,), dtype=np.float64)
-    )
+    def __init__(self, n_in_channels: int):
+        """
+        Initialize the neuron with a specified number of input channels.
 
-    # State variables
-    z_start: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0,), dtype=np.float64)
-    )
-    z_length: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0,), dtype=np.float64)
-    )
-    z_lim: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0,), dtype=np.float64)
-    )
-    z_ck0: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0, 0), dtype=np.float64)
-    )
-    z_ck1: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0, 0), dtype=np.float64)
-    )
-    z_c0: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0,), dtype=np.float64)
-    )  # c0 = np.inner(i_c0[:, :-1], weight) + self.i_c0[:, -1]
-    z_c1: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0,), dtype=np.float64)
-    )  # c1 = np.inner(i_c1[:, :-1], weight) + self.i_c1[:, -1]
-    dz_start: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0,), dtype=np.float64)
-    )
-    dz_length: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0,), dtype=np.float64)
-    )
-    dz_lim: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0,), dtype=np.float64)
-    )
-    dz_ck0: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0, 0), dtype=np.float64)
-    )
-    dz_ck1: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0, 0), dtype=np.float64)
-    )
-    dz_c0: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0,), dtype=np.float64)
-    )
-    dz_c1: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0,), dtype=np.float64)
-    )
+        Args:
+            n_in_channels (int | np.intp): Number of input channels.
+        """
+        if n_in_channels < 0:
+            raise ValueError(
+                f"n_in_channels must be non-negative, got {n_in_channels}."
+            )
+        self.n_in_channels = n_in_channels
 
-    # Solver
-    solver: Solver = field(default_factory=lambda: Solver(0))
+        # Synaptic weights for each input channel
+        self.weight = np.zeros(n_in_channels, dtype=np.float64)
 
-    @property
-    def n_in_channels(self) -> int:
-        """Number of input channels."""
-        return self.weight.size
+        # Potential state variables
+        self.z_start = np.empty((0,), dtype=np.float64)
+        self.z_length = np.empty((0,), dtype=np.float64)
+        self.z_lim = np.empty((0,), dtype=np.float64)
+        self.z_c0 = np.empty((0,), dtype=np.float64)
+        self.z_c1 = np.empty((0,), dtype=np.float64)
+        self.z_ck0 = np.empty((0, n_in_channels + 1), dtype=np.float64)
+        self.z_ck1 = np.empty((0, n_in_channels + 1), dtype=np.float64)
+
+        # Derivative of the potential state variables
+        self.dz_start = np.empty((0,), dtype=np.float64)
+        self.dz_length = np.empty((0,), dtype=np.float64)
+        self.dz_lim = np.empty((0,), dtype=np.float64)
+        self.dz_c0 = np.empty((0,), dtype=np.float64)
+        self.dz_c1 = np.empty((0,), dtype=np.float64)
+        self.dz_ck0 = np.empty((0, n_in_channels + 1), dtype=np.float64)
+        self.dz_ck1 = np.empty((0, n_in_channels + 1), dtype=np.float64)
+
+        # QProgram
+        self.solver = QProgram(n_in_channels)
 
     @property
     def n_z_intervals(self) -> int:
@@ -428,7 +635,7 @@ class Neuron:
         """Number of intervals partitioning the time axis for the potential derivative."""
         return self.dz_start.size
 
-    def init_solver(
+    def init_learning(
         self,
         f_times: npt.NDArray[np.float64],
         in_times: npt.NDArray[np.float64],
@@ -450,9 +657,9 @@ class Neuron:
         if dzmin <= 0.0:
             raise ValueError(f"dzmin must be positive, got {dzmin}.")
 
-        n_in_channels = np.max(in_channels, initial=-1) + 1
-        self.solver.__init__(n_in_channels)
-        self.weight = np.zeros(n_in_channels, dtype=np.float64)
+        logger.debug("Initialize the neuron for learning...")
+
+        self.weight.fill(np.nan)
 
         if f_times.size > 0:
             f_times.sort()
@@ -464,25 +671,30 @@ class Neuron:
             z_start, z_length, z_lim, z_ck0, z_ck1 = [], [], [], [], []
             dz_start, dz_length, dz_lim, dz_ck0, dz_ck1 = [], [], [], [], []
 
+            A_f_times = []
+            b_f_times = []
+
             for in_times_n, times_n, offset in zip(in_times, times, f_times):
                 start, length, ck0, ck1 = compute_ck(
                     in_times_n,
                     in_channels,
-                    n_in_channels,
+                    self.n_in_channels,
                     times_n,
                     REFRACTORY_RESET,
                 )
 
                 # Firing time constraint | z >= f_thresh
-                res = self.solver.add_constraint(
-                    # zi_f_c_n[:-1], z_f_lim_n - zi_f_c_n[-1]
-                    -ck0[-1, :-1],
-                    -f_thresh + ck0[-1, -1],
-                )
-                if res < 0:
-                    raise ValueError(
-                        f"The firing time constraint at time {start[-1]} is not feasible."
-                    )
+                A_f_times.append(-ck0[-1, :-1])
+                b_f_times.append(-f_thresh + ck0[-1, -1])
+                # self.solver.add_constraints(
+                #     # zi_f_c_n[:-1], z_f_lim_n - zi_f_c_n[-1]
+                #     -ck0[-1, :-1],
+                #     -f_thresh + ck0[-1, -1],
+                # )
+                # if res < 0:
+                #     raise ValueError(
+                #         f"The firing time constraint at time {start[-1]} is not feasible."
+                #     )
 
                 ## Silent time intervals | z <= zmax
                 silent = start < times_n[0]
@@ -518,12 +730,15 @@ class Neuron:
             self.dz_lim = np.concatenate(dz_lim)
             self.dz_ck0 = np.concatenate(dz_ck0)
             self.dz_ck1 = np.concatenate(dz_ck1)
+
+            self.solver.add_constraints(np.vstack(A_f_times), np.array(b_f_times))
+
         else:
             in_times = in_times % period
             start, length, ck0, ck1 = compute_ck(
                 in_times,
                 in_channels,
-                n_in_channels,
+                self.n_in_channels,
                 np.array([0.0, period]),
                 0.0,
             )
@@ -539,71 +754,92 @@ class Neuron:
             self.dz_start = np.empty((0,), dtype=np.float64)
             self.dz_length = np.empty((0,), dtype=np.float64)
             self.dz_lim = np.empty((0,), dtype=np.float64)
-            self.dz_ck0 = np.empty((0, n_in_channels + 1), dtype=np.float64)
-            self.dz_ck1 = np.empty((0, n_in_channels + 1), dtype=np.float64)
+            self.dz_ck0 = np.empty((0, self.n_in_channels + 1), dtype=np.float64)
+            self.dz_ck1 = np.empty((0, self.n_in_channels + 1), dtype=np.float64)
 
-    def refine_constraints(self, feas_tol: float = 1e-6) -> int:
+        logger.debug(
+            f"Neuron initialized successfully! The time axis has been decomposed into {self.n_z_intervals} (potential) and {self.n_dz_intervals} (potential derivative) intervals. The solver has been initialized with {self.solver.n_cstrs} constraints for {self.solver.n_vars} variables."
+        )
 
-        if self.n_z_intervals > 0:
-            self.z_c0 = np.inner(self.z_ck0[:, :-1], self.solver.x) + self.z_ck0[:, -1]
-            self.z_c1 = np.inner(self.z_ck1[:, :-1], self.solver.x) + self.z_ck1[:, -1]
-            z_imax, z_vmax, z_dtmax = find_maximum(
-                self.z_c0, self.z_c1, self.z_length, self.z_lim
-            )
-        else:
-            z_vmax = -np.inf
-            z_dtmax = 0.0
+    def refine_constraints(self, ftol: float = 1e-9, n_cstrs_per_template: int = 1) -> int:
+        """
+        Refine the constraints based on the current optimal weights.
 
-        if self.n_dz_intervals > 0:
-            self.dz_c0 = (
-                np.inner(self.dz_ck0[:, :-1], self.solver.x) + self.dz_ck0[:, -1]
-            )
-            self.dz_c1 = (
-                np.inner(self.dz_ck1[:, :-1], self.solver.x) + self.dz_ck1[:, -1]
-            )
-            dz_imax, dz_vmax, dz_dtmax = find_maximum(
-                self.dz_c0, self.dz_c1, self.dz_length, self.dz_lim
-            )
-        else:
-            dz_vmax = -np.inf
-            dz_dtmax = 0.0
+        Args:
+            ftol (float, optional): minimum value for a constraint to be considered violated. Defaults to 1e-6.
+            n_cstrs_per_template (int, optional): number of constraints to add for each template. Defaults to 1.
 
-        if z_vmax <= feas_tol and dz_vmax <= feas_tol:
+        Returns:
+            (int): the status of the constraint refinement:
+                - 1 if all constraints are satisfied,
+                - 0 if a new constraint was added,
+                - -1 if the refinement failed.
+        """
+
+        raise NotImplementedError(
+            "TODO: Implement refinements with multiple constraints at a time..."
+        )
+
+        self.z_c0 = np.inner(self.z_ck0[:, :-1], self.solver.x) + self.z_ck0[:, -1]
+        self.z_c1 = np.inner(self.z_ck1[:, :-1], self.solver.x) + self.z_ck1[:, -1]
+        z_dvmax, z_imax, z_dtmax = find_maximum_violation(
+            self.z_c0, self.z_c1, self.z_length, self.z_lim + ftol
+        ) or (0.0, None, None)
+
+        self.dz_c0 = np.inner(self.dz_ck0[:, :-1], self.solver.x) + self.dz_ck0[:, -1]
+        self.dz_c1 = np.inner(self.dz_ck1[:, :-1], self.solver.x) + self.dz_ck1[:, -1]
+        dz_dvmax, dz_imax, dz_dtmax = find_maximum_violation(
+            self.dz_c0, self.dz_c1, self.dz_length, self.dz_lim + ftol
+        ) or (0.0, None, None)
+
+        if z_dvmax == 0.0 and dz_dvmax == 0.0:
+            logger.info("All constraints are satisfied.")
             return 1
-        else:
-            if z_vmax > dz_vmax and np.isfinite(z_dtmax):
-                return self.solver.add_constraint(
+
+        if z_dvmax >= dz_dvmax and z_imax is not None and z_dtmax is not None:
+            if np.isfinite(z_dtmax):
+                self.solver.add_constraints(
                     (self.z_ck0[z_imax, :-1] + z_dtmax * self.z_ck1[z_imax, :-1])
                     * np.exp(-z_dtmax),
                     self.z_lim[z_imax]
                     - (self.z_ck0[z_imax, -1] + z_dtmax * self.z_ck1[z_imax, -1])
                     * np.exp(-z_dtmax),
                 )
-                # print(
-                #     f"New potential constraint added at time {self.z_start[z_imax] + z_dtmax}!"
-                # )
-
             else:
-                return self.solver.add_constraint(
+                self.solver.add_constraints(
+                    np.zeros(self.solver.n_vars), self.z_lim[z_imax]
+                )
+            logger.debug(
+                f"A violation of the potential template has been detected on the {z_imax}th time interval"
+            )
+            return 0
+
+        elif z_dvmax < dz_dvmax and dz_imax is not None and dz_dtmax is not None:
+            if np.isfinite(dz_dtmax):
+                self.solver.add_constraints(
                     (self.dz_ck0[dz_imax, :-1] + dz_dtmax * self.dz_ck1[dz_imax, :-1])
                     * np.exp(-dz_dtmax),
                     self.dz_lim[dz_imax]
                     - (self.dz_ck0[dz_imax, -1] + dz_dtmax * self.dz_ck1[dz_imax, -1])
                     * np.exp(-dz_dtmax),
                 )
+            else:
+                self.solver.add_constraints(
+                    np.zeros(self.solver.n_vars), self.z_lim[z_imax]
+                )
+            logger.debug(
+                f"A violation of the potential derivative template has been detected on the {dz_imax}th time interval"
+            )
+            return 0
 
-                # print(
-                #     f"New potential derivative constraint added at time {self.dz_start[dz_imax] + dz_dtmax}!"
-                # )
-            # return 0
+        logger.critical("Refinement failed...")
+        return -1
 
     def learn(
         self,
-        feas_tol: float = 1e-3,
-        conv_tol: float = 1e-6,
+        ftol: float = 1e-9,
+        atol: float = 1e-9,
         n_cstrs: int = 1000,
-        n_iter: int = 10000,
-        order: int = 2,
     ) -> int:
         """Learn the synaptic weights to produce the desired firing times when fed with the prescribed input spikes.
 
@@ -619,31 +855,22 @@ class Neuron:
         """
 
         for i in range(n_cstrs):
-            # 1. DCD algorithm: repeat the following steps until convergence (of the primal cost) or n_iter reached:
-            # 1.1 dual coordinate descent step in the dual space
-            # 1.2 convert the dual vector to a primal vector
-            # 1.3 compute the cost of the primal vector
-            res = self.solver.solve(
-                feas_tol, conv_tol, n_iter, order=order
-            )
+            res = self.solver.solve(atol=atol)
             if res < 1:
                 return res
 
-            # 2. Refine constraints based on the current primal solution. If no constraints are violated, then the primal solution is optimal.
-            res_refine = self.refine_constraints(feas_tol)
-            if res_refine == 0:
-                print(f"Iteration {i+1}: {self.solver.n_cstrs} constraints.")
-            elif res_refine == 1:
-                print(
-                    f"Solved in {i+1} iterations! Cost is {self.solver.cost:.3f} for {self.solver.n_cstrs} constraints."
+            # 2. Refine constraints based on the current primal solution.
+            res_refine = self.refine_constraints(ftol)
+            if (
+                res_refine > 0
+            ):  # If no constraints are violated, then the primal solution is optimal.
+                logger.debug(
+                    f"Solved in {i+1} iterations! Number of variables: {self.solver.n_vars}. Number of constraints: {self.solver.n_cstrs}. Cost: {self.solver.primal_cost:.3f}."
                 )
                 self.weight = np.copy(self.solver.x)
                 return 1
-            else:
-                print(
-                    f"Constraints refinement failed in iteration {i+1}, problem is infeasible."
-                )
-                return -1
 
-        print("Maximum number of constraint refinements reached without convergence.")
+        logger.debug(
+            "Neuron optimization did not converge within the maximum number of iterations."
+        )
         return 0
