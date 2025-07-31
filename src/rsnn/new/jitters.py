@@ -3,7 +3,7 @@ import numpy.typing as npt
 from scipy.sparse.linalg import eigs
 from tqdm.autonotebook import trange
 
-from rsnn.constants import REFRACTORY_RESET
+from .constants import REFRACTORY_RESET
 
 
 def compute_phi(

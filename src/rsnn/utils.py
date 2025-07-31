@@ -1,3 +1,4 @@
+import logging
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
@@ -7,14 +8,39 @@ import numpy.typing as npt
 from rsnn.constants import REFRACTORY_PERIOD
 
 
-def is_valid_f_times(f_times: npt.NDArray[np.float64], period: float | np.float64=np.inf) -> bool | np.bool:
+def setup_logging(
+    name: str, console_level: str, file_level: str
+) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel("DEBUG")
+    formatter = logging.Formatter(
+        "%(asctime)s.%(msecs)03d' - %(levelname)s - %(message)s",
+        style="%",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(console_level)
+    logger.addHandler(console_handler)
+
+    file_handler = logging.FileHandler("app.log", mode="a", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(file_level)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+def is_valid_f_times(
+    f_times: npt.NDArray[np.float64], period: float | np.float64 = np.inf
+) -> bool | np.bool:
     """
     Returns a boolean indicating whether the firing times satisfy the refractory condition.
 
     Args:
         f_times (npt.NDArray[np.float64]): The firing times of a neuron.
         period (float): the cycle period. For non-periodic spike trains, use np.inf (default).
-    
+
     Returns:
         (bool): the boolean indicating satisfaction of the refractory condition.
     """
@@ -26,8 +52,11 @@ def is_valid_f_times(f_times: npt.NDArray[np.float64], period: float | np.float6
         return period > REFRACTORY_PERIOD
     else:
         return True
-    
-def are_valid_f_times(f_times: List[npt.NDArray[np.float64]], period: float | np.float64=np.inf) -> bool | np.bool:
+
+
+def are_valid_f_times(
+    f_times: List[npt.NDArray[np.float64]], period: float | np.float64 = np.inf
+) -> bool | np.bool:
     """
     Returns a boolean indicating whether the firing times satisfy the refractory condition on every channel.
 
@@ -43,8 +72,11 @@ def are_valid_f_times(f_times: List[npt.NDArray[np.float64]], period: float | np
             return False
     return True
 
+
 def in_times_from_f_times(
-    f_times: List[npt.NDArray[np.float64]], in_delays: npt.NDArray[np.float64], in_sources: npt.NDArray[np.intp]
+    f_times: List[npt.NDArray[np.float64]],
+    in_delays: npt.NDArray[np.float64],
+    in_sources: npt.NDArray[np.intp],
 ) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.intp]]:
     """
     Extracts the input times from the firing times and input delays.
@@ -56,10 +88,7 @@ def in_times_from_f_times(
         npt.NDArray[np.float64]: Array of input times.
     """
     in_times = np.concatenate(
-        [
-            f_times[in_src] + in_delay
-            for in_src, in_delay in zip(in_sources, in_delays)
-        ]
+        [f_times[in_src] + in_delay for in_src, in_delay in zip(in_sources, in_delays)]
     )
     in_channels = np.concatenate(
         [
@@ -67,8 +96,11 @@ def in_times_from_f_times(
             for in_channel, in_src in enumerate(in_sources)
         ]
     )
-    print(f"Input times shape: {in_times.shape}, Input channels shape: {in_channels.shape}")
+    print(
+        f"Input times shape: {in_times.shape}, Input channels shape: {in_channels.shape}"
+    )
     return in_times, in_channels
+
 
 def connections_to_in_delays(
     connections: Dict[Tuple[int, int], List[Tuple[float, float]]], target_id: int
@@ -83,8 +115,7 @@ def connections_to_in_delays(
         Dict[int, List[float]]: Dictionary mapping neuron source IDs to lists of delays.
     """
     in_delays = defaultdict(list)
-    for (src_id, tgt_id), conns in connections.items() :
+    for (src_id, tgt_id), conns in connections.items():
         if tgt_id == target_id:
             in_delays[src_id].extend(d for d, _ in conns)
     return in_delays
-

@@ -114,7 +114,6 @@ def test_neuron_clean_states():
         np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float64),
     )
 
-
     # Clean the states at time 1.5
     neuron.clean_states(1.5)
     assert len(neuron.starts) == 5
@@ -194,40 +193,45 @@ def test_neuron_step():
 
 
 def test_simulator_initialization():
+    rng = np.random.default_rng(42)
+
+    n_neurons = 3
+    n_inputs = 5 # number of inputs per neuron
+
     # Create a list of neurons
-    neurons: List[Neuron] = [Neuron() for _ in range(3)]
+    neurons = [Neuron() for _ in range(n_neurons)]
 
-    # Create a dictionary of connections between these neurons
-    connections: Dict[Tuple[int, int], List[Tuple[float, float]]] = defaultdict(list)
-    connections[(0, 1)].append((1.0, 1.0))
-    connections[(1, 2)].append((0.5, 2.0))
-    connections[(2, 0)].append((0.25, 1.5))
-    connections[(2, 0)].append((0.75, 0.5))
+    # Create connections between neurons
+    co_sources = rng.integers(0, n_neurons, size=(n_neurons, n_inputs))
+    co_delays = rng.uniform(0.0, 10.0, size=(n_neurons, n_inputs))
+    co_weights = np.zeros_like(co_delays)
 
-    simulator = Simulator(neurons, connections)
+    simulator = Simulator(neurons, co_sources, co_delays, co_weights)
 
     # Check if the neurons are added correctly
-    assert simulator.num_neurons == 3
-    assert simulator.num_connections == 4
-
+    assert simulator.n_neurons == n_neurons
+    assert simulator.n_connections == n_neurons * n_inputs
 
 def test_simulator_save_and_load():
+    rng = np.random.default_rng(42)
+
+    n_neurons = 3
+    n_inputs = 5 # number of inputs per neuron
+
     # Create a list of neurons
-    neurons: List[Neuron] = [
+    neurons = [
         Neuron(0.5, np.array([0.0, 2.0])),
         Neuron(1.25, np.array([1.0, 3.0])),
         Neuron(1.0, np.array([1.0, 7.0])),
     ]
 
-    # Create a dictionary of connections between these neurons
-    connections: Dict[Tuple[int, int], List[Tuple[float, float]]] = defaultdict(list)
-    connections[(0, 1)].append((1.0, 1.0))
-    connections[(1, 2)].append((0.5, 2.0))
-    connections[(2, 0)].append((0.25, 1.5))
-    connections[(2, 0)].append((0.75, 0.5))
+    # Create connections between neurons
+    co_sources = rng.integers(0, n_neurons, size=(n_neurons, n_inputs))
+    co_delays = rng.uniform(0.0, 10.0, size=(n_neurons, n_inputs))
+    co_weights = np.zeros_like(co_delays)
 
     # Create a simulator with these neurons and connections
-    simulator = Simulator(neurons, connections)
+    simulator = Simulator(neurons, co_sources, co_delays, co_weights)
 
     # Save the simulator to a file
     file_path = "test_simulator.json"
@@ -237,8 +241,8 @@ def test_simulator_save_and_load():
     loaded_simulator = Simulator.load_from_json(file_path)
 
     # Check if the loaded simulator is equal to the original simulator
-    assert loaded_simulator.num_neurons == simulator.num_neurons
-    assert loaded_simulator.num_connections == simulator.num_connections
+    assert loaded_simulator.n_neurons == simulator.n_neurons
+    assert loaded_simulator.n_connections == simulator.n_connections
     for i in range(len(simulator.neurons)):
         assert loaded_simulator.neurons[i].threshold == simulator.neurons[i].threshold
         assert np.array_equal(
@@ -250,82 +254,92 @@ def test_simulator_save_and_load():
 
 def test_simulator_propagate_spikes():
     # Create a list of neurons
-    neurons: List[Neuron] = [Neuron() for _ in range(3)]
+    neurons = [Neuron() for _ in range(3)]
 
-    # Create a dictionary of connections between these neurons
-    connections: Dict[Tuple[int, int], List[Tuple[float, float]]] = defaultdict(list)
-    connections[(0, 1)].append((1.0, 1.0))
-    connections[(1, 2)].append((0.5, 2.0))
-    connections[(0, 2)].append((0.25, 1.5))
-    connections[(0, 2)].append((0.75, 0.5))
+    # Create connections between neurons
+    co_sources = np.array([[1, 2], [0, 0], [2, 0]])
+    co_delays = np.array([[1.0, 2.0], [2.0, 3.0], [3.0, 1.0]])
+    co_weights = np.zeros_like(co_delays)
 
     # Create a simulator with these neurons and connections
-    simulator = Simulator(neurons, connections)
+    simulator = Simulator(neurons, co_sources, co_delays, co_weights)
 
     # Neuron 0 fires at time 1.0
-    f_time, src_id = 1.0, 0
-    simulator.propagate_spikes(f_time, src_id, 1e-2)
+    simulator.propagate_spikes(f_time=1.0, src_id=0, std_threshold=1e-2)
 
     assert np.allclose(simulator.neurons[0].f_times, [1.0])
     assert np.allclose(simulator.neurons[1].f_times, [])
     assert np.allclose(simulator.neurons[2].f_times, [])
 
     assert np.allclose(simulator.neurons[0].starts[1:-1], [1.0])
-    assert np.allclose(simulator.neurons[1].starts[1:-1], [2.0])
-    assert np.allclose(simulator.neurons[2].starts[1:-1], [1.25, 1.75])
+    assert np.allclose(simulator.neurons[1].starts[1:-1], [3.0, 4.0])
+    assert np.allclose(simulator.neurons[2].starts[1:-1], [2.0])
 
 
 def test_simulator_init_from_f_times():
     # Create a list of neurons
     neurons: List[Neuron] = [
-        Neuron(0.5, np.array([0.0, 1.0])),
-        Neuron(1.25, np.array([2.0])),
-        Neuron(1.0, np.array([1.0, 4.0])),
+        Neuron(f_times = np.array([0.0, 1.0])),
+        Neuron(f_times = np.array([2.0])),
+        Neuron(f_times = np.array([1.0, 4.0])),
     ]
 
-    # Create a dictionary of connections between these neurons
-    connections: Dict[Tuple[int, int], List[Tuple[float, float]]] = defaultdict(list)
-    connections[(0, 1)].append((2.0, 1.0))
-    connections[(1, 2)].append((2.5, 2.0))
-    connections[(0, 2)].append((2.25, 1.5))
-    connections[(0, 2)].append((3.75, 0.5))
+    # Create connections between neurons
+    co_sources = np.array([[1, 2], [0, 0], [2, 0]])
+    co_delays = np.array([[1.0, 2.0], [2.0, 3.0], [3.0, 1.0]])
+    co_weights = np.zeros_like(co_delays)
 
     # Create a simulator with these neurons and connections
-    simulator = Simulator(neurons, connections)
-
+    simulator = Simulator(neurons, co_sources, co_delays, co_weights)
     simulator.init_from_f_times()
 
     assert np.allclose(simulator.neurons[0].f_times, [0.0, 1.0])
     assert np.allclose(simulator.neurons[1].f_times, [2.0])
     assert np.allclose(simulator.neurons[2].f_times, [1.0, 4.0])
 
-    assert np.allclose(simulator.neurons[0].starts[1:-1], [1.0])
-    assert np.allclose(simulator.neurons[1].starts[1:-1], [2.0, 2.0, 3.0])
-    assert np.allclose(simulator.neurons[2].starts[1:-1], [4.0, 4.5, 4.75])
+    assert np.allclose(simulator.neurons[0].starts[1:-1], [1.0, 3.0, 3.0, 6.0])
+    assert np.allclose(simulator.neurons[1].starts[1:-1], [2.0, 2.0, 3.0, 3.0, 4.0])
+    assert np.allclose(simulator.neurons[2].starts[1:-1], [4.0, 4.0, 7.0])
 
 
 def test_simulator_step():
+    # # Create a list of neurons
+    # neurons: List[Neuron] = [
+    #     Neuron(f_times=np.array([0.0])),
+    #     Neuron(f_times=np.array([2.0])),
+    #     Neuron(),
+    # ]
+
+    # # Create a dictionary of connections between these neurons
+    # connections: Dict[Tuple[int, int], List[Tuple[float, float]]] = defaultdict(list)
+    # connections[(0, 1)].append((1.0, 2.0))
+    # connections[(0, 1)].append((2.0, -0.25))
+    # connections[(1, 2)].append((1.0, 1.0))
+    # connections[(0, 2)].append((3.0, 2.0))
+
+    # # Create a simulator with these neurons and connections
+    # simulator = Simulator(neurons, connections)
+    # simulator.init_from_f_times()
+
     # Create a list of neurons
     neurons: List[Neuron] = [
-        Neuron(f_times=np.array([0.0])),
-        Neuron(f_times=np.array([2.0])),
-        Neuron(),
+        Neuron(f_times = np.array([0.0, 1.0])),
+        Neuron(f_times = np.array([2.0])),
+        Neuron(f_times = np.array([1.0, 4.0])),
     ]
 
-    # Create a dictionary of connections between these neurons
-    connections: Dict[Tuple[int, int], List[Tuple[float, float]]] = defaultdict(list)
-    connections[(0, 1)].append((1.0, 2.0))
-    connections[(0, 1)].append((2.0, -0.25))
-    connections[(1, 2)].append((1.0, 1.0))
-    connections[(0, 2)].append((3.0, 2.0))
+    # Create connections between neurons
+    co_sources = np.array([[1, 2], [0, 0], [2, 0]])
+    co_delays = np.array([[1.0, 2.0], [2.0, 3.0], [3.0, 1.0]])
+    co_weights = np.ones_like(co_delays)
 
     # Create a simulator with these neurons and connections
-    simulator = Simulator(neurons, connections)
+    simulator = Simulator(neurons, co_sources, co_delays, co_weights)
     simulator.init_from_f_times()
 
     # Step the simulator at time 0.0
     time = simulator.step(0.0)
     assert time is not None
-    assert np.allclose(neurons[0].f_times, [0.0])
-    assert np.allclose(neurons[1].f_times, [2.0])
-    assert np.allclose(neurons[2].f_times, [3.619061286735945])
+    assert np.allclose(neurons[0].f_times, [0.0, 1.0])
+    assert np.allclose(neurons[1].f_times, [2.0, 4.16437639])
+    assert np.allclose(neurons[2].f_times, [1.0, 4.0])

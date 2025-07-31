@@ -48,19 +48,34 @@ def first_crossing(
 @dataclass
 class Neuron:
     """Represents a neuron with its states and firing times."""
+
     # Firing threshold
     threshold: float = FIRING_THRESHOLD
 
     # Firing times
-    f_times: npt.NDArray[np.float64] = field(default_factory=lambda: np.empty((0,), dtype=np.float64))
+    f_times: npt.NDArray[np.float64] = field(
+        default_factory=lambda: np.empty((0,), dtype=np.float64)
+    )
 
     # State variables
-    starts: npt.NDArray[np.float64] = field(default_factory=lambda: np.array([-np.inf, np.inf], dtype=np.float64))
-    lengths: npt.NDArray[np.float64] = field(default_factory=lambda: np.array([np.inf, np.inf], dtype=np.float64))
-    c0s: npt.NDArray[np.float64] = field(default_factory=lambda: np.zeros((2,), dtype=np.float64))
-    c1s: npt.NDArray[np.float64] = field(default_factory=lambda: np.zeros((2,), dtype=np.float64))
-    dc0s: npt.NDArray[np.float64] = field(default_factory=lambda: np.zeros((2,), dtype=np.float64))
-    dc1s: npt.NDArray[np.float64] = field(default_factory=lambda: np.zeros((2,), dtype=np.float64))
+    starts: npt.NDArray[np.float64] = field(
+        default_factory=lambda: np.array([-np.inf, np.inf], dtype=np.float64)
+    )
+    lengths: npt.NDArray[np.float64] = field(
+        default_factory=lambda: np.array([np.inf, np.inf], dtype=np.float64)
+    )
+    c0s: npt.NDArray[np.float64] = field(
+        default_factory=lambda: np.zeros((2,), dtype=np.float64)
+    )
+    c1s: npt.NDArray[np.float64] = field(
+        default_factory=lambda: np.zeros((2,), dtype=np.float64)
+    )
+    dc0s: npt.NDArray[np.float64] = field(
+        default_factory=lambda: np.zeros((2,), dtype=np.float64)
+    )
+    dc1s: npt.NDArray[np.float64] = field(
+        default_factory=lambda: np.zeros((2,), dtype=np.float64)
+    )
 
     # def __init__(
     #     self,
@@ -209,9 +224,12 @@ class Neuron:
             if self.starts[n] < tmax:
                 self.lengths[n] = self.starts[n + 1] - self.starts[n]
                 self.c0s[n] = (
-                    self.c0s[n - 1] + np.nan_to_num(self.lengths[n-1]) * self.c1s[n - 1]
-                ) * np.exp(-self.lengths[n-1]) + self.dc0s[n]
-                self.c1s[n] = self.c1s[n - 1] * np.exp(-self.lengths[n-1]) + self.dc1s[n]
+                    self.c0s[n - 1]
+                    + np.nan_to_num(self.lengths[n - 1]) * self.c1s[n - 1]
+                ) * np.exp(-self.lengths[n - 1]) + self.dc0s[n]
+                self.c1s[n] = (
+                    self.c1s[n - 1] * np.exp(-self.lengths[n - 1]) + self.dc1s[n]
+                )
 
                 # update_state_forward_backward_(
                 #     self.states[n],
@@ -232,7 +250,6 @@ class Neuron:
             else:
                 break
 
-
         return t if t is not None and t < tmax else None
 
     def step(self, tmin, tmax) -> Optional[np.float64]:
@@ -244,23 +261,34 @@ class Simulator:
     def __init__(
         self,
         neurons: List[Neuron],
-        connections: Dict[Tuple[int, int], List[Tuple[float, float]]],
+        conn_sources: npt.NDArray[np.int64],
+        conn_delays: npt.NDArray[np.float64],
+        conn_weights: npt.NDArray[np.float64],
+        # connections: Dict[Tuple[int, int], List[Tuple[float, float]]],
     ):
         """
+        Initialize the simulator with a list of L neurons and connections (sources, weights, delays).
+        Each neuron receives the same number of inputs K.
 
         Args:
-            neurons (_type_): _description_
-            connections (Dict[Tuple[int, int], List[Tuple[float, float]]]): _description_
+            neurons (_type_): List of `Neuron` objects representing the neurons in the network.
+            conn_sources (_type_): Array of source neuron IDs for each connection, with shape (L, K).
+            conn_delays (_type_): Array of delays for each connection, with shape (L, K).
+            conn_weights (_type_): Array of weights for each connection, with shape (L, K).
         """
         # self.outgoing: Dict[int, List[OutConnection]] = defaultdict(list)
         # self.incoming: Dict[int, List[InConnection]] = defaultdict(list)
         self.neurons: List[Neuron] = neurons
         # self.connections: Dict[Tuple[int, int], List[Tuple[float, float]]] = defaultdict(list)
-        self.connections: Dict[Tuple[int, int], List[Tuple[float, float]]] = connections
+        # self.connections: Dict[Tuple[int, int], List[Tuple[float, float]]] = connections
         # self.fpaths: Dict[Tuple[int, int], float] = defaultdict(lambda: float("inf"))
 
+        self.conn_sources = conn_sources
+        self.conn_delays = conn_delays
+        self.conn_weights = conn_weights
+
     @property
-    def num_neurons(self) -> int:
+    def n_neurons(self) -> int:
         """Get the number of neurons in the network.
 
         Returns:
@@ -269,13 +297,14 @@ class Simulator:
         return len(self.neurons)
 
     @property
-    def num_connections(self) -> int:
+    def n_connections(self) -> int:
         """Get the number of connections in the network.
 
         Returns:
             int: the number of connections in the network.
         """
-        return sum(len(conns) for conns in self.connections.values())
+        # return sum(len(conns) for conns in self.connections.values())
+        return self.conn_sources.size
 
     def run(self, start: float, end: float, std_threshold: float = 0.0):
         time = start
@@ -299,12 +328,26 @@ class Simulator:
         self.neurons[src_id].fire(f_time, np.random.normal(0, std_threshold))
 
         # Propagate the spikes to the target neurons, by updating their states
-        for tgt_id, tgt_neuron in enumerate(self.neurons):
-            starts = np.array(
-                [f_time + conn[0] for conn in self.connections[(src_id, tgt_id)]]
-            )
-            dc1s = np.array([conn[1] for conn in self.connections[(src_id, tgt_id)]])
-            tgt_neuron.add_states(
+        # for tgt_id, tgt_neuron in enumerate(self.neurons):
+        #     starts = np.array(
+        #         [f_time + conn[0] for conn in self.connections[(src_id, tgt_id)]]
+        #     )
+        #     dc1s = np.array([conn[1] for conn in self.connections[(src_id, tgt_id)]])
+        #     tgt_neuron.add_states(
+        #         starts,
+        #         np.full_like(starts, np.inf),
+        #         np.zeros_like(starts),
+        #         np.zeros_like(starts),
+        #         np.zeros_like(starts),
+        #         dc1s,
+        #     )
+
+        # Propagate the spikes to the target neurons, by updating their states
+        for tgt_id in range(self.n_neurons):
+            select_from = self.conn_sources[tgt_id] == src_id
+            starts = f_time + self.conn_delays[tgt_id][select_from]
+            dc1s = self.conn_weights[tgt_id][select_from]
+            self.neurons[tgt_id].add_states(
                 starts,
                 np.full_like(starts, np.inf),
                 np.zeros_like(starts),
@@ -313,23 +356,57 @@ class Simulator:
                 dc1s,
             )
 
+        # for tgt_id, tgt_neuron in enumerate(self.neurons):
+        #     starts = np.array(
+        #         [f_time + conn[0] for conn in self.connections[(src_id, tgt_id)]]
+        #     )
+        #     dc1s = np.array([conn[1] for conn in self.connections[(src_id, tgt_id)]])
+        #     tgt_neuron.add_states(
+        #         starts,
+        #         np.full_like(starts, np.inf),
+        #         np.zeros_like(starts),
+        #         np.zeros_like(starts),
+        #         np.zeros_like(starts),
+        #         dc1s,
+        #     )
+
     def init_from_f_times(self):
         """Initialize the neurons' states based on their firing times."""
         for tgt_id, tgt_neuron in enumerate(self.neurons):
             tgt_neuron.clear_states()
-            starts = np.array([
-                f_time + conn[0]
-                for (src_id, scr_neuron) in enumerate(self.neurons)
-                for f_time in scr_neuron.f_times
-                for conn in self.connections[(src_id, tgt_id)]
-            ])
+            starts = np.concatenate(
+                [
+                    (
+                        self.neurons[src_id].f_times[None, :]
+                        + self.conn_delays[tgt_id][self.conn_sources[tgt_id] == src_id][
+                            :, None
+                        ]
+                    ).reshape(-1)
+                    for src_id in range(self.n_neurons)
+                ]
+            )
+            dc1s = np.concatenate(
+                [
+                    np.repeat(
+                        self.conn_weights[tgt_id][self.conn_sources[tgt_id] == src_id],
+                        self.neurons[src_id].f_times.size,
+                    )
+                    for src_id in range(self.n_neurons)
+                ]
+            )
+            # starts = np.array([
+            #     f_time + conn[0]
+            #     for (src_id, scr_neuron) in enumerate(self.neurons)
+            #     for f_time in scr_neuron.f_times
+            #     for conn in self.connections[(src_id, tgt_id)]
+            # ])
 
-            dc1s = np.array([
-                conn[1]
-                for (src_id, scr_neuron) in enumerate(self.neurons)
-                for _ in scr_neuron.f_times
-                for conn in self.connections[(src_id, tgt_id)]
-            ])
+            # dc1s = np.array([
+            #     conn[1]
+            #     for (src_id, scr_neuron) in enumerate(self.neurons)
+            #     for _ in scr_neuron.f_times
+            #     for conn in self.connections[(src_id, tgt_id)]
+            # ])
 
             tgt_neuron.add_states(
                 starts,
@@ -350,43 +427,64 @@ class Simulator:
                 {
                     "threshold": neuron.threshold,
                     "f_times": neuron.f_times.tolist(),
+                    "sources": self.conn_sources[id].tolist(),
+                    "delays": self.conn_delays[id].tolist(),
+                    "weights": self.conn_weights[id].tolist(),
                 }
-                for neuron in self.neurons
+                for id, neuron in enumerate(self.neurons)
             ],
-            "connections": {
-                f"{source_id},{target_id}": [
-                    {
-                        "delay": conn[0],
-                        "weight": conn[1],
-                    }
-                    for conn in conns
-                ]
-                for (source_id, target_id), conns in self.connections.items()
-            },
+            # "co_sources": self.conn_sources.tolist(),
+            # "co_delays": self.conn_delays.tolist(),
+            # "co_weights": self.conn_weights.tolist(),
+            # "connections": {
+            #     f"{source_id},{target_id}": [
+            #         {
+            #             "delay": conn[0],
+            #             "weight": conn[1],
+            #         }
+            #         for conn in conns
+            #     ]
+            #     for (source_id, target_id), conns in self.connections.items()
+            # },
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Simulator":
         """Create a network from a dictionary loaded from JSON"""
         # Restore neurons
-        neurons = []
-        for neuron_data in data["neurons"]:
-            neurons.append(
-                Neuron(
-                    threshold=neuron_data["threshold"],
-                    f_times=neuron_data["f_times"],
-                )
-            )
+        # neurons = []
+        # for neuron_data in data["neurons"]:
+        #     neurons.append(
+        #         Neuron(
+        #             threshold=neuron_data["threshold"],
+        #             f_times=neuron_data["f_times"],
+        #         )
+        #     )
 
-        # Restore connections
-        connections = defaultdict(list)
-        for k, conns in data["connections"].items():
-            source_id, target_id = map(int, k.split(","))
-            connections[(source_id, target_id)] = [
-                (conn["delay"], conn["weight"]) for conn in conns
-            ]
+        neurons = [
+            Neuron(threshold=neuron_data["threshold"], f_times=neuron_data["f_times"])
+            for neuron_data in data["neurons"]
+        ]
 
-        return cls(neurons, connections)
+        sources = np.array([
+            neuron_data["sources"] for neuron_data in data["neurons"]
+        ], dtype=np.int64)
+        delays = np.array([
+            neuron_data["delays"] for neuron_data in data["neurons"]
+        ], dtype=np.float64)
+        weights = np.array([
+            neuron_data["weights"] for neuron_data in data["neurons"]
+        ], dtype=np.float64)
+
+        # # Restore connections
+        # connections = defaultdict(list)
+        # for k, conns in data["connections"].items():
+        #     source_id, target_id = map(int, k.split(","))
+        #     connections[(source_id, target_id)] = [
+        #         (conn["delay"], conn["weight"]) for conn in conns
+        #     ]
+
+        return cls(neurons, sources, delays, weights)
 
     def save_to_json(self, filepath: str):
         """Save the network to a JSON file"""
