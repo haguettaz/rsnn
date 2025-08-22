@@ -1,499 +1,285 @@
-import json
-from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
-import numpy.typing as npt
-from scipy.special import lambertw
+import polars as pl
 
-from rsnn.constants import FIRING_THRESHOLD, REFRACTORY_RESET
+from .channels import *
+from .constants import *
+from .log import *
+from .states import *
 
+logger = setup_logging(__name__, console_level="DEBUG", file_level="INFO")
 
-def first_crossing(
-    start: float,
-    length: float,
-    c0: float,
-    c1: float,
-    threshold: float,
-) -> Optional[np.float64]:
-
-    if c0 < threshold:
-        if c1 > 0:
-            dt = -(lambertw(-threshold / c1 * np.exp(-c0 / c1), 0)) - c0 / c1
-            if np.isreal(dt) and (dt >= 0.0) and (dt < length):
-                return np.float64(start + dt.real)
-        elif c1 < 0:
-            dt = (
-                -(
-                    lambertw(
-                        -threshold / c1 * np.exp(-c0 / c1),
-                        -1,
-                    )
-                )
-                - c0 / c1
-            )
-            if np.isreal(dt) and (dt >= 0.0) and (dt < length):
-                return np.float64(start + dt.real)
-        elif threshold < 0:
-            dt = np.log(c0 / threshold)
-            if (dt >= 0.0) and (dt < length):
-                return np.float64(start + dt)
-        return None
-
-    else:
-        return np.float64(start)
+STATE_CHUNK_SIZE = 20_000
 
 
-@dataclass
-class Neuron:
-    """Represents a neuron with its states and firing times."""
-
-    # Firing threshold
-    threshold: float = FIRING_THRESHOLD
-
-    # Firing times
-    f_times: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty((0,), dtype=np.float64)
+def filter_new_spikes(new_spikes, min_delays):
+    """Filter new spikes based on minimum propagation delays. All causally independent spikes are kept."""
+    max_times = (
+        min_delays.join(new_spikes, left_on="source", right_on="neuron", how="inner")
+        .with_columns(
+            (pl.col("time") + pl.col("delay")).alias("max_time"),
+        )
+        .group_by("target")
+        .agg(pl.min("max_time"))
     )
-
-    # State variables
-    starts: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.array([-np.inf, np.inf], dtype=np.float64)
+    new_spikes = new_spikes.join(
+        max_times, left_on="neuron", right_on="target", how="left"
     )
-    lengths: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.array([np.inf, np.inf], dtype=np.float64)
+    new_spikes = new_spikes.remove(pl.col("time") > pl.col("max_time"))
+    return new_spikes.select("neuron", "time")
+
+
+def extract_next_spikes(states):
+    """Extract the first next spike per group, e.g., neuron."""
+    new_spikes = (
+        states.filter(pl.col("f_time").is_not_nan())
+        .group_by("neuron")
+        .agg(pl.min("f_time").alias("time"))
     )
-    c0s: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.zeros((2,), dtype=np.float64)
+    return new_spikes
+
+
+def cleanse_states_recovery(states, neurons):
+    """Remove all states before the last spike (reset)."""
+    states = states.join(
+        neurons.select("neuron", "last_f_time"), on="neuron", how="left"
     )
-    c1s: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.zeros((2,), dtype=np.float64)
+    states = states.remove(pl.col("start") <= pl.col("last_f_time")).drop("last_f_time")
+    return states
+
+
+def cleanse_states_causal(states, tmin):
+    states = states.filter(pl.col("start") >= tmin)
+    return states
+
+
+def create_recovery_states(spikes):
+    states = spikes.with_columns(
+        pl.col("time").alias("start"),
+        pl.lit(REFRACTORY_RESET, pl.Float64).alias("w0"),
+        pl.lit(0.0, pl.Float64).alias("w1"),
+        pl.lit(REFRACTORY_RESET, pl.Float64).alias("c0"),
+        pl.lit(0.0, pl.Float64).alias("c1"),
     )
-    dc0s: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.zeros((2,), dtype=np.float64)
+    return states.select("neuron", "start", "w0", "w1", "c0", "c1")
+
+
+def create_synaptic_states(spikes, synapses):
+    states = synapses.join(spikes, left_on="source", right_on="neuron", how="inner")
+    states = states.with_columns(
+        (pl.col("time") + pl.col("delay")).alias("start"),
+        pl.col("target").alias("neuron"),
+        pl.col("w0").alias("c0"),
+        pl.col("w1").alias("c1"),
     )
-    dc1s: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.zeros((2,), dtype=np.float64)
+    return states.select("neuron", "start", "w0", "w1", "c0", "c1")
+
+
+def update_f_thresh(states, neurons):
+    """Update the firing thresholds in states."""
+    # Update the firing thresholds for the spiking neurons
+    return states.update(neurons, on="neuron")
+
+
+def compute_f_time(states):
+    """Update rising crossing time in states."""
+    f_times = compute_rising_crossing_times(
+        states.get_column("f_thresh").to_numpy(),
+        states.get_column("start").to_numpy(),
+        states.get_column("length").to_numpy(),
+        states.get_column("c0").to_numpy(),
+        states.get_column("c1").to_numpy(),
     )
+    return states.with_columns(f_time=f_times)
 
-    # def __init__(
-    #     self,
-    #     threshold: float = FIRING_THRESHOLD,
-    #     f_times: Optional[npt.NDArray[np.float64]] = None,
-    # ):
-    #     self.threshold = threshold
-    #     self.f_times = (
-    #         np.sort(f_times)
-    #         if f_times is not None
-    #         else np.empty((0,), dtype=np.float64)
-    #     )
 
-    #     self.clear_states()
+def filter_spikes(spikes, min_delays):
+    """Filter new spikes based on minimum propagation delays. All causally independent spikes are kept."""
+    max_times = (
+        min_delays.join(spikes, left_on="source", right_on="neuron", how="inner")
+        .with_columns(
+            (pl.col("time") + pl.col("delay")).alias("max_time"),
+        )
+        .group_by("target")
+        .agg(pl.min("max_time"))
+    )
+    spikes = spikes.join(max_times, left_on="neuron", right_on="target", how="left")
+    spikes = spikes.remove(pl.col("time") > pl.col("max_time"))
+    return spikes.select("neuron", "time")
 
-    def add_f_times(self, f_times: npt.NDArray[np.float64]):
-        """Add firing times to the neuron's firing times."""
-        self.f_times = np.sort(np.concatenate((self.f_times, f_times)))
 
-    def init_initial_state(self):
-        self.starts[0] = -np.inf
-        self.lengths[0] = np.inf
-        self.c0s[0] = 0.0
-        self.c1s[0] = 0.0
-        self.dc0s[0] = 0.0
-        self.dc1s[0] = 0.0
+def filter_states(states, min_delays, spikes):
+    max_times = (
+        min_delays.join(spikes, left_on="source", right_on="neuron", how="inner")
+        .with_columns(
+            (pl.col("time") + pl.col("delay")).alias("max_time"),
+        )
+        .group_by("target")
+        .agg(pl.min("max_time"))
+    )
+    states = states.join(max_times, left_on="neuron", right_on="target", how="left")
+    states = states.remove(pl.col("start") > pl.col("max_time"))
+    return states.drop("max_time")
 
-    def clear_states(self):
-        self.starts = np.array([-np.inf, np.inf], dtype=np.float64)
-        self.lengths = np.array([np.inf, np.inf], dtype=np.float64)
-        self.c0s = np.zeros((2,), dtype=np.float64)
-        self.c1s = np.zeros((2,), dtype=np.float64)
-        self.dc0s = np.zeros((2,), dtype=np.float64)
-        self.dc1s = np.zeros((2,), dtype=np.float64)
-        # self.states = np.concatenate((initial_state(), final_state()), axis=0)
 
-    def add_states(self, starts, lengths, c0s, c1s, dc0s, dc1s):
-        """Merge new states into the existing states."""
+def update_new_spikes(states, new_spikes, min_delays):
+    states = compute_f_time(states)
+    new_spikes = filter_new_spikes(
+        new_spikes.extend(
+            states.group_by("neuron").agg(pl.col("f_time").min().alias("time"))
+        ),
+        min_delays,
+    )
+    return new_spikes
 
-        self.starts = np.concatenate((self.starts, starts), axis=0)
-        self.lengths = np.concatenate((self.lengths, lengths), axis=0)
-        self.c0s = np.concatenate((self.c0s, c0s), axis=0)
-        self.c1s = np.concatenate((self.c1s, c1s), axis=0)
-        self.dc0s = np.concatenate((self.dc0s, dc0s), axis=0)
-        self.dc1s = np.concatenate((self.dc1s, dc1s), axis=0)
 
-        sorter = np.argsort(self.starts)
-        self.starts = self.starts[sorter]
-        self.lengths = self.lengths[sorter]
-        self.c0s = self.c0s[sorter]
-        self.c1s = self.c1s[sorter]
-        self.dc0s = self.dc0s[sorter]
-        self.dc1s = self.dc1s[sorter]
+# def create_states(
+#     neuron,
+#     start,
+#     length=None,
+#     w0=0.0,
+#     w1=0.0,
+#     c0=None,
+#     c1=None,
+#     f_thresh=None,
+#     f_time=None,
+# ):
+#     data = {
+#         "neuron": neuron,
+#         "start": start,
+#         "length": length,
+#         "w0": w0,
+#         "w1": w1,
+#         "c0": c0,
+#         "c1": c1,
+#         "f_thresh": f_thresh,
+#         "f_time": f_time,
+#     }
+#     schema = {
+#         "neuron": pl.UInt32,
+#         "start": pl.Float64,
+#         "length": pl.Float64,
+#         "w0": pl.Float64,
+#         "w1": pl.Float64,
+#         "c0": pl.Float64,
+#         "c1": pl.Float64,
+#         "f_thresh": pl.Float64,
+#         "f_time": pl.Float64,
+#     }
+#     return pl.DataFrame(data, schema)
 
-    def fire(self, f_time: float, noise: float = 0.0):
-        # Add the firing time to the list of firing times
-        self.f_times = np.append(self.f_times, f_time)
 
-        # Add threshold noise
-        self.threshold = FIRING_THRESHOLD + noise
+def create_initial_states(neurons, spikes, synapses):
 
-        # Enter refractory period
-        self.recover(f_time)
+    # neurons is a dataframe with columns: index, f_thresh, last_f_time (potentially null)
+    # spikes is a dataframe with columns: neuron, time
+    # synapses is a dataframe with columns: source, target, delay, w0, w1
 
-    def recover(self, f_time: float):
-        """
-        Clear the states and enter the refractory period at the given firing time.
-        This method ensures that the neuron's states consist at least of the initial state, the refractory state, and the final state.
-        """
-        # Clear states and enter refractory period
-        ipos = np.searchsorted(self.starts, f_time, side="left")  # always >= 1
-        if ipos > 1:
-            self.starts = self.starts[(ipos - 2) :]
-            self.lengths = self.lengths[(ipos - 2) :]
-            self.c0s = self.c0s[(ipos - 2) :]
-            self.c1s = self.c1s[(ipos - 2) :]
-            self.dc0s = self.dc0s[(ipos - 2) :]
-            self.dc1s = self.dc1s[(ipos - 2) :]
+    # 1. Synaptic states
+    syn_states = create_synaptic_states(spikes, synapses)
+    # syn_states = synapses.join(spikes, left_on="source", right_on="neuron")
+    # syn_states = syn_states.with_columns(
+    #     pl.col("target").alias("neuron"),
+    #     (pl.col("time") + pl.col("delay")).alias("start"),
+    # )
+    # syn_states = syn_states.select(
+    #     pl.col("neuron"),
+    #     pl.col("start"),
+    #     pl.col("w0"),
+    #     pl.col("w1"),
+    # )
+    syn_states = cleanse_states_recovery(syn_states, neurons)
 
-            self.init_initial_state()
-        else:
-            self.starts = np.concatenate((np.array([-np.inf]), self.starts))
-            self.lengths = np.concatenate((np.array([np.inf]), self.lengths))
-            self.c0s = np.concatenate((np.array([0.0]), self.c0s))
-            self.c1s = np.concatenate((np.array([0.0]), self.c1s))
-            self.dc0s = np.concatenate((np.array([0.0]), self.dc0s))
-            self.dc1s = np.concatenate((np.array([0.0]), self.dc1s))
+    # 2. Refractory states
+    last_spikes = neurons.select("neuron", "last_f_time").rename(
+        {"last_f_time": "time"}
+    )
+    rec_states = create_recovery_states(last_spikes)
 
-        self.starts[1] = f_time
-        self.lengths[1] = np.inf
-        self.c0s[1] = REFRACTORY_RESET
-        self.c1s[1] = 0.0
-        self.dc0s[1] = REFRACTORY_RESET
-        self.dc1s[1] = 0.0
+    # 3. Merge all states
+    states = pl.concat([syn_states, rec_states])
 
-    def clean_states(self, time: float):
-        """
-        Clean the states by removing those that end before the given time, while ensuring validity of the first state.
-        Note 1: the states necessarily contain at least two states: the initial state and the final state.
-        Note 2: one should have self.states[0]["start"] <= time
+    # 4. Update states information
+    states = states.sort("start")
+    states = states.with_columns(pl.lit(None, pl.Float64).alias("f_thresh"))
+    states = update_f_thresh(states, neurons)
+    states = update_length(states, over="neuron", fill_value=float("inf"))
+    states = update_coef(states, over="neuron")
 
-        Args:
-            time (float): The time before which states should be removed.
-        """
-        ipos = np.searchsorted(self.starts, time, side="right") - 1  # always >= 0
-        print(ipos)
+    return states
 
-        if ipos > 0:  # if there are states to clean
-            for i in range(1, ipos + 1):
 
-                dt = np.nan_to_num(self.starts[i] - self.starts[i - 1])
-                self.c0s[i] = (self.c0s[i - 1] + dt * self.c1s[i - 1]) * np.exp(
-                    -dt
-                ) + self.dc0s[i]
-                self.c1s[i] = self.c1s[i - 1] * np.exp(-dt) + self.dc1s[i]
+def simulate(
+    neurons, spikes, synapses, min_delays, states, start, end, f_thresh_noise=None
+):
+    """
+    Run the simulation from tmin to tmax.
 
-                # update_state_forward_(
-                #     self.states[i],
-                #     self.states[i - 1],
-                # )
+    neurons has columns: index, f_thresh, last_f_time
+    spikes has columns: neuron, time
+    states has columns: neuron, start, w0, w1, length, c0, c1, f_thresh, f_time
+    synapses has columns: source, target, delay, w0, w1
 
-            self.starts = self.starts[ipos - 1 :]
-            self.lengths = self.lengths[ipos - 1 :]
-            self.c0s = self.c0s[ipos - 1 :]
-            self.c1s = self.c1s[ipos - 1 :]
-            self.dc0s = self.dc0s[ipos - 1 :]
-            self.dc1s = self.dc1s[ipos - 1 :]
+    """
+    if f_thresh_noise is None:
+        f_thresh_noise = lambda _: FIRING_THRESHOLD
 
-            self.init_initial_state()
+    # Main simulation loop
+    time = start
+    while time < end:
+        # # Get the current spikes
+        # states = update_f_time(
+        #     states
+        # )  # Slowest operation | Problem: Many computed f_time are useless, we only need the smallest f_time (per neuron). Solution: Compute per chunk instead??? Possibility to combine with filtering through min_delays?
 
-            self.dc0s[1] = self.c0s[1]
-            self.dc1s[1] = self.c1s[1]
+        # # Accept as many spikes as possible, based on the minimum propagation delay
+        # new_spikes = extract_next_spikes(states)
+        # new_spikes = filter_new_spikes(new_spikes, min_delays)
 
-            # init_state(self.states[0], -np.inf, 0.0, 0.0)
-            # init_state(
-            #     self.states[1],
-            #     self.states[1]["start"],
-            #     self.states[1]["c0"],
-            #     self.states[1]["c1"],
-            # )
-
-    def next_firing_time(self, tmax: float) -> Optional[np.float64]:
-        t = None
-
-        for n in range(1, self.starts.shape[0] - 1):
-            if self.starts[n] < tmax:
-                self.lengths[n] = self.starts[n + 1] - self.starts[n]
-                self.c0s[n] = (
-                    self.c0s[n - 1]
-                    + np.nan_to_num(self.lengths[n - 1]) * self.c1s[n - 1]
-                ) * np.exp(-self.lengths[n - 1]) + self.dc0s[n]
-                self.c1s[n] = (
-                    self.c1s[n - 1] * np.exp(-self.lengths[n - 1]) + self.dc1s[n]
-                )
-
-                # update_state_forward_backward_(
-                #     self.states[n],
-                #     prev_state=self.states[n - 1],
-                #     next_state=self.states[n + 1],
-                # )
-
-                t = first_crossing(
-                    self.starts[n],
-                    self.lengths[n],
-                    self.c0s[n],
-                    self.c1s[n],
-                    self.threshold,
-                )
-                # t = first_crossing(self.states[n], self.threshold)
-                if t is not None:
-                    break
-            else:
+        new_spikes = pl.DataFrame(schema={"neuron": pl.UInt32, "time": pl.Float64})
+        for states_chunk in states.iter_slices(STATE_CHUNK_SIZE):
+            # 1. Filter chunk with new_spikes and min_delays
+            states_chunk = filter_states(states_chunk, min_delays, new_spikes)
+            if states_chunk.height == 0:
                 break
 
-        return t if t is not None and t < tmax else None
+            # 2. Update new_spikes
+            new_spikes = update_new_spikes(states_chunk, new_spikes, min_delays)
 
-    def step(self, tmin, tmax) -> Optional[np.float64]:
-        self.clean_states(tmin)
-        return self.next_firing_time(tmax)
+        # Update the simulation time
+        time = new_spikes["time"].min() or end
+        logger.debug(f"Simulation time: {time}")
 
+        # Add new spikes and update firing threshold of spiking neurons
+        spikes = spikes.vstack(new_spikes)
+        neurons = neurons.update(
+            new_spikes.rename({"time": "last_f_time"}).with_columns(
+                f_thresh=f_thresh_noise(new_spikes.height),
+            ),
+            on="neuron",
+        )
 
-class Simulator:
-    def __init__(
-        self,
-        neurons: List[Neuron],
-        conn_sources: npt.NDArray[np.int64],
-        conn_delays: npt.NDArray[np.float64],
-        conn_weights: npt.NDArray[np.float64],
-        # connections: Dict[Tuple[int, int], List[Tuple[float, float]]],
-    ):
-        """
-        Initialize the simulator with a list of L neurons and connections (sources, weights, delays).
-        Each neuron receives the same number of inputs K.
+        # Synaptic states from new spikes
+        syn_states = create_synaptic_states(new_spikes, synapses)
+        states = states.extend(
+            syn_states.match_to_schema(states.schema, missing_columns="insert")
+        )
 
-        Args:
-            neurons (_type_): List of `Neuron` objects representing the neurons in the network.
-            conn_sources (_type_): Array of source neuron IDs for each connection, with shape (L, K).
-            conn_delays (_type_): Array of delays for each connection, with shape (L, K).
-            conn_weights (_type_): Array of weights for each connection, with shape (L, K).
-        """
-        # self.outgoing: Dict[int, List[OutConnection]] = defaultdict(list)
-        # self.incoming: Dict[int, List[InConnection]] = defaultdict(list)
-        self.neurons: List[Neuron] = neurons
-        # self.connections: Dict[Tuple[int, int], List[Tuple[float, float]]] = defaultdict(list)
-        # self.connections: Dict[Tuple[int, int], List[Tuple[float, float]]] = connections
-        # self.fpaths: Dict[Tuple[int, int], float] = defaultdict(lambda: float("inf"))
+        # Recovery states from new spikes
+        states = cleanse_states_recovery(states, neurons)  # reset
+        rec_states = create_recovery_states(new_spikes)
+        states = states.extend(
+            rec_states.match_to_schema(states.schema, missing_columns="insert")
+        )
 
-        self.conn_sources = conn_sources
-        self.conn_delays = conn_delays
-        self.conn_weights = conn_weights
+        # Sort states and sort coefficients
+        states = states.sort("neuron", "start")
+        states = update_f_thresh(states, neurons)
+        states = update_length(states, over="neuron", fill_value=float("inf"))
+        states = update_coef(states, over="neuron")  # second slowest operation
 
-    @property
-    def n_neurons(self) -> int:
-        """Get the number of neurons in the network.
+        # Causal cleansing: filter out states that are useless for simulation after current time
+        states = cleanse_states_causal(states, time)
 
-        Returns:
-            int: the number of neurons in the network.
-        """
-        return len(self.neurons)
-
-    @property
-    def n_connections(self) -> int:
-        """Get the number of connections in the network.
-
-        Returns:
-            int: the number of connections in the network.
-        """
-        # return sum(len(conns) for conns in self.connections.values())
-        return self.conn_sources.size
-
-    def run(self, start: float, end: float, std_threshold: float = 0.0):
-        time = start
-        while time < end:
-            time = self.step(time, std_threshold)
-
-    def step(self, tmin: float, std_threshold: float = 0.0) -> np.float64:
-        tmax = np.inf
-        for id, neuron in enumerate(self.neurons):
-            f_time = neuron.step(tmin, tmax)
-            if f_time is not None:
-                (src_id, tmax) = (id, f_time)
-
-        if np.isfinite(tmax):
-            self.propagate_spikes(tmax, src_id, std_threshold)
-
-        return np.float64(tmax)
-
-    def propagate_spikes(self, f_time, src_id, std_threshold: float = 0.0):
-        # Make the neurons fire
-        self.neurons[src_id].fire(f_time, np.random.normal(0, std_threshold))
-
-        # Propagate the spikes to the target neurons, by updating their states
-        # for tgt_id, tgt_neuron in enumerate(self.neurons):
-        #     starts = np.array(
-        #         [f_time + conn[0] for conn in self.connections[(src_id, tgt_id)]]
-        #     )
-        #     dc1s = np.array([conn[1] for conn in self.connections[(src_id, tgt_id)]])
-        #     tgt_neuron.add_states(
-        #         starts,
-        #         np.full_like(starts, np.inf),
-        #         np.zeros_like(starts),
-        #         np.zeros_like(starts),
-        #         np.zeros_like(starts),
-        #         dc1s,
-        #     )
-
-        # Propagate the spikes to the target neurons, by updating their states
-        for tgt_id in range(self.n_neurons):
-            select_from = self.conn_sources[tgt_id] == src_id
-            starts = f_time + self.conn_delays[tgt_id][select_from]
-            dc1s = self.conn_weights[tgt_id][select_from]
-            self.neurons[tgt_id].add_states(
-                starts,
-                np.full_like(starts, np.inf),
-                np.zeros_like(starts),
-                np.zeros_like(starts),
-                np.zeros_like(starts),
-                dc1s,
-            )
-
-        # for tgt_id, tgt_neuron in enumerate(self.neurons):
-        #     starts = np.array(
-        #         [f_time + conn[0] for conn in self.connections[(src_id, tgt_id)]]
-        #     )
-        #     dc1s = np.array([conn[1] for conn in self.connections[(src_id, tgt_id)]])
-        #     tgt_neuron.add_states(
-        #         starts,
-        #         np.full_like(starts, np.inf),
-        #         np.zeros_like(starts),
-        #         np.zeros_like(starts),
-        #         np.zeros_like(starts),
-        #         dc1s,
-        #     )
-
-    def init_from_f_times(self):
-        """Initialize the neurons' states based on their firing times."""
-        for tgt_id, tgt_neuron in enumerate(self.neurons):
-            tgt_neuron.clear_states()
-            starts = np.concatenate(
-                [
-                    (
-                        self.neurons[src_id].f_times[None, :]
-                        + self.conn_delays[tgt_id][self.conn_sources[tgt_id] == src_id][
-                            :, None
-                        ]
-                    ).reshape(-1)
-                    for src_id in range(self.n_neurons)
-                ]
-            )
-            dc1s = np.concatenate(
-                [
-                    np.repeat(
-                        self.conn_weights[tgt_id][self.conn_sources[tgt_id] == src_id],
-                        self.neurons[src_id].f_times.size,
-                    )
-                    for src_id in range(self.n_neurons)
-                ]
-            )
-            # starts = np.array([
-            #     f_time + conn[0]
-            #     for (src_id, scr_neuron) in enumerate(self.neurons)
-            #     for f_time in scr_neuron.f_times
-            #     for conn in self.connections[(src_id, tgt_id)]
-            # ])
-
-            # dc1s = np.array([
-            #     conn[1]
-            #     for (src_id, scr_neuron) in enumerate(self.neurons)
-            #     for _ in scr_neuron.f_times
-            #     for conn in self.connections[(src_id, tgt_id)]
-            # ])
-
-            tgt_neuron.add_states(
-                starts,
-                np.full_like(starts, np.inf),
-                np.zeros_like(starts),
-                np.zeros_like(starts),
-                np.zeros_like(starts),
-                dc1s,
-            )
-
-            if tgt_neuron.f_times.size > 0:
-                tgt_neuron.recover(tgt_neuron.f_times[-1])
-
-    def to_dict(self) -> dict:
-        """Convert the network to a dictionary for JSON serialization"""
-        return {
-            "neurons": [
-                {
-                    "threshold": neuron.threshold,
-                    "f_times": neuron.f_times.tolist(),
-                    "sources": self.conn_sources[id].tolist(),
-                    "delays": self.conn_delays[id].tolist(),
-                    "weights": self.conn_weights[id].tolist(),
-                }
-                for id, neuron in enumerate(self.neurons)
-            ],
-            # "co_sources": self.conn_sources.tolist(),
-            # "co_delays": self.conn_delays.tolist(),
-            # "co_weights": self.conn_weights.tolist(),
-            # "connections": {
-            #     f"{source_id},{target_id}": [
-            #         {
-            #             "delay": conn[0],
-            #             "weight": conn[1],
-            #         }
-            #         for conn in conns
-            #     ]
-            #     for (source_id, target_id), conns in self.connections.items()
-            # },
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "Simulator":
-        """Create a network from a dictionary loaded from JSON"""
-        # Restore neurons
-        # neurons = []
-        # for neuron_data in data["neurons"]:
-        #     neurons.append(
-        #         Neuron(
-        #             threshold=neuron_data["threshold"],
-        #             f_times=neuron_data["f_times"],
-        #         )
-        #     )
-
-        neurons = [
-            Neuron(threshold=neuron_data["threshold"], f_times=neuron_data["f_times"])
-            for neuron_data in data["neurons"]
-        ]
-
-        sources = np.array([
-            neuron_data["sources"] for neuron_data in data["neurons"]
-        ], dtype=np.int64)
-        delays = np.array([
-            neuron_data["delays"] for neuron_data in data["neurons"]
-        ], dtype=np.float64)
-        weights = np.array([
-            neuron_data["weights"] for neuron_data in data["neurons"]
-        ], dtype=np.float64)
-
-        # # Restore connections
-        # connections = defaultdict(list)
-        # for k, conns in data["connections"].items():
-        #     source_id, target_id = map(int, k.split(","))
-        #     connections[(source_id, target_id)] = [
-        #         (conn["delay"], conn["weight"]) for conn in conns
-        #     ]
-
-        return cls(neurons, sources, delays, weights)
-
-    def save_to_json(self, filepath: str):
-        """Save the network to a JSON file"""
-        with open(filepath, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
-
-    @classmethod
-    def load_from_json(cls, filepath: str) -> "Simulator":
-        """Load a network from a JSON file"""
-        with open(filepath, "r") as f:
-            data = json.load(f)
-        return cls.from_dict(data)
+    return spikes, states

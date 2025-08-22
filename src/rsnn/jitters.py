@@ -1,93 +1,135 @@
 import numpy as np
-import numpy.typing as npt
-from scipy.sparse.linalg import eigs
-from tqdm.autonotebook import trange
+import polars as pl
+import scipy.sparse as ss
+from numba import njit
 
-from rsnn.constants import REFRACTORY_RESET
+from .constants import REFRACTORY_RESET
+from .log import setup_logging
+from .spikes import extend_with_time_prev
+from .utils import modulo_with_offset
+
+# Set up logging
+logger = setup_logging(__name__, console_level="DEBUG", file_level="INFO")
 
 
-def compute_phi(
-    f_sources: npt.NDArray[np.int64],
-    f_times: npt.NDArray[np.float64],
-    c_sources: npt.NDArray[np.int64],
-    c_delays: npt.NDArray[np.float64],
-    c_weights: npt.NDArray[np.float64],
-    period: float,
-) -> npt.NDArray[np.float64]:
-    """Compute the largest eigenvalue of the deflated period-to-period jitter propagation matrix Phi.
+@njit
+def compute_phi_matrix(A, n_spikes):
+    Phi = np.identity(n_spikes, dtype=np.float64)
+    for n in range(n_spikes):
+        Phi[n] = A[n] @ Phi
+    Phi -= 1 / n_spikes
+    return Phi
 
-    Args:
-        f_sources (npt.NDArray[np.int64]): The indices of the neurons producing the firing events, with shape (M,).
-        f_times (npt.NDArray[np.float64]): The times of the firing events, with shape (M,).
-        c_sources (npt.NDArray[np.int64]): The indices of the neurons at the source of the connections, with shape (L, K).
-        c_delays (npt.NDArray[np.float64]): The delays of the connections, with shape (L, K).
-        c_weights (npt.NDArray[np.float64]): The weights of the connections, with shape (L, K).
-        period (float): The period of the network dynamics.
 
-    Returns:
-        npt.NDArray[np.float64]: The largest eigenvalue of the deflated period-to-period jitter propagation matrix Phi.
-    """
+def compute_phi_eigenvals(spikes, synapses, k=3):
+    # Spikes is a dataframe with columns: index, period, neuron, origin, time, prev_time
+    # Synapses is a dataframe with columns: source, target, delay, weight
+    # States is a dataframe with columns: f_index_source, f_index_target, f_time_in_target (=f_time_out_source + delay), f_time_out_target, w0, w1 (index, period, f_time_out_source, and delay are optional)
+    phis = {}
+    for (i,), spikes_i in spikes.partition_by(
+        "index", include_key=False, as_dict=True
+    ).items():
+        ## Extend spikes with additional information
+        spikes_i = extend_with_time_prev(spikes_i, over="neuron")  # result is sorted
+        spikes_i = spikes_i.with_columns(
+            pl.int_range(pl.len(), dtype=pl.UInt32).alias("f_index")
+        )
 
-    M = f_times.size
+        ## Refractoriness
+        rec_states = spikes_i.with_columns(
+            pl.col("neuron").alias("source"),
+            pl.col("neuron").alias("target"),
+            pl.col("f_index")
+            .gather((pl.int_range(pl.len()) - 1) % pl.len())
+            .over("neuron")
+            .alias("f_index_source"),
+            pl.col("f_index").alias("f_index_target"),
+            pl.col("time_prev").alias("f_time_in_target"),
+            pl.col("time").alias("f_time_out_target"),
+            pl.lit(REFRACTORY_RESET, pl.Float64).alias("w0"),
+            pl.lit(0.0, pl.Float64).alias("w1"),
+        ).select(
+            "source",
+            "target",
+            "f_index_source",
+            "f_index_target",
+            "f_time_in_target",
+            "f_time_out_target",
+            "w0",
+            "w1",
+        )
 
-    # Compute the indices that sort the firing times and create sorted views
-    ids = np.argsort(f_times)
-    f_sources = f_sources[ids]
-    f_times = f_times[ids]
+        ## Synaptic transmission
+        # 0. Compute origins for each neuron
+        origins_i = spikes_i.group_by("neuron").agg(
+            pl.min("time_prev").alias("time_origin")
+        )
 
-    # Compute the deflated period-to-period jitter propagation matrix Phi
-    Phi = np.identity(M)
-    for m in trange(M):
-        f_source = f_sources[m]  # neuron index producing the m-th spike
+        # 1. Extract synapses to spiking neurons (the other synapses can be ignored, i.e., have weights = 0.0)
+        synapses_i = synapses.join(
+            spikes_i, left_on="target", right_on="neuron", how="semi"
+        )
 
-        # Views on the connections to the neuron producing the m-th spike
-        sources = c_sources[f_source]
-        weights = c_weights[f_source]
-        delays = c_delays[f_source]
+        # 2. Create synaptic states
+        syn_states = synapses_i.join(
+            spikes_i, left_on="source", right_on="neuron"
+        ).join(origins_i, left_on="target", right_on="neuron")
+        syn_states = syn_states.with_columns(
+            pl.col("f_index").alias("f_index_source"),
+            pl.lit(None, pl.UInt32).alias("f_index_target"),
+            modulo_with_offset(
+                pl.col("time") + pl.col("delay"),
+                pl.col("period"),
+                pl.col("time_origin"),
+            ).alias("f_time_in_target"),
+            pl.lit(None, pl.Float64).alias("f_time_out_target"),
+        )
+        syn_states = syn_states.select(
+            "source",
+            "target",
+            "f_index_source",
+            "f_index_target",
+            "f_time_in_target",
+            "f_time_out_target",
+            "w0",
+            "w1",
+        )
 
-        # Get the previous spike generated by the same neuron
-        f_time = f_times[m]
-        
-        i = 1
-        while f_sources[(m - i) % M] != f_sources[m]:
-            i += 1
+        # Merge and sort (grouped by neuron)
+        states = pl.concat([syn_states, rec_states])
+        states = states.sort("f_time_in_target")
+        states = states.with_columns(
+            pl.col("f_index_target").forward_fill().over("target"),
+            pl.col("f_time_out_target").forward_fill().over("target"),
+        )
+        states = states.with_columns(
+            (pl.col("f_time_out_target") - pl.col("f_time_in_target")).alias("delta")
+        )
 
-        prev_f_time = f_times[(m - i) % M] - period * np.floor_divide(
-            f_times[(m - i) % M] - f_time + period, period
-        )  # Adjust for periodicity, so that f_time - period <= prev_f_time < f_time
-
-        am = np.zeros(M)
-        am[(m - i) % M] -= REFRACTORY_RESET * np.exp(
-            -(f_time - prev_f_time)
-        ) # Refractoriness contribution to the slope at the m-th spike
-
-        for mi in range(M):
-            # Compute the contribution of the mi-th spike to the potential slope at the m-th spike, through the synaptic connections
-            select_from = sources == f_sources[mi]
-            in_weights = weights[select_from]
-            in_f_times = (
-                f_times[mi]
-                + delays[select_from]
-                - period
-                * np.floor_divide(
-                    f_times[mi] + delays[select_from] - prev_f_time, period
-                )
-            )  # Adjust for periodicity, so that prev_f_time <= in_f_times < prev_f_time + period
-
-            am[mi] += np.sum(
-                in_weights
-                * (1 - (f_time - in_f_times))
-                * np.exp(-(f_time - in_f_times)),
-                where=in_f_times <= f_time,
+        # Aggregate states for spike to spike contributions
+        agg_states = states.group_by(["f_index_source", "f_index_target"]).agg(
+            (
+                (pl.col("w1") - pl.col("w0") - pl.col("w1") * pl.col("delta"))
+                * (-pl.col("delta")).exp()
             )
+            .sum()
+            .alias("coef")
+        )
 
-        # Normalize the contributions to ensure they sum to 1
-        am /= np.sum(am)
+        # Build linear propagation operator
+        A = ss.csr_array(
+            (
+                agg_states["coef"].to_numpy(),
+                (
+                    agg_states["f_index_target"].to_numpy(),
+                    agg_states["f_index_source"].to_numpy(),
+                ),
+            ),
+        ).todense()
+        A /= np.sum(A, axis=1, keepdims=True)
 
-        Phi[m] = am @ Phi
+        Phi = compute_phi_matrix(A, spikes_i.height)
 
-    # Deflate the matrix to get rid of the global drift
-    Phi -= 1 / M
+        phis[i] = np.abs(ss.linalg.eigs(Phi, k=k, return_eigenvectors=False))
 
-    # Compute the spectral radius of the deflated matrix
-    return np.abs(eigs(Phi, k=1, which="LM", return_eigenvectors=False))
+    return phis

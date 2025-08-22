@@ -3,241 +3,345 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import polars as pl
 from scipy.stats import truncnorm
 
-from rsnn.constants import REFRACTORY_PERIOD
+from .channels import new_channels
+from .constants import REFRACTORY_PERIOD
 
 
-def build_connections(
-    src_ids: npt.NDArray[np.intp],
-    tgt_ids: npt.NDArray[np.intp],
-    delays: npt.NDArray[np.float64],
-) -> Dict[Tuple[int, int], List[Tuple[float, float]]]:
-    """Helper function to build connections dictionary from source and target IDs and delays.
-
-    Args:
-        src_ids (npt.NDArray[np.intp]): Array of source neuron IDs
-        tgt_ids (npt.NDArray[np.intp]): Array of target neuron IDs
-        delays (npt.NDArray[np.float64]): Array of connection delays
-
-    Returns:
-        Dict[Tuple[int, int], List[Tuple[float, float]]]: Dictionary of connections where keys are tuples
-        of (source_id, target_id) and values are lists of (delay, weight) tuples.
-    """
-    connections: Dict[Tuple[int, int], List[Tuple[float, float]]] = defaultdict(list)
-    for i in range(len(src_ids)):
-        key = (int(src_ids[i]), int(tgt_ids[i]))
-        connections[key].append((float(delays[i]), 0.0))
-    return connections
-
-
-def rand_connections_fin(
+def rand_synapses(
     n_neurons: int,
-    n_in_per_neuron: int,
+    n_synapses: int,
     min_delay: float,
     max_delay: float,
     rng: Optional[np.random.Generator] = None,
-) -> Dict[Tuple[int, int], List[Tuple[float, float]]]:
-    """Generate random connections for a neural network, where each neuron has a fixed number of incoming connections.
+) -> pl.DataFrame:
+    """Generate random synapses for a spiking neural network without connectivity restrictions.
 
     Args:
-        n_neurons (int): Number of neurons in the network
-        n_in_per_neuron (int): Number of incoming connections per neuron
-        min_delay (float): Minimum connection delay
-        max_delay (float): Maximum connection delay
-        rng (Optional[np.random.Generator]): Random number generator. If None, uses default_rng()
+        n_neurons: Number of neurons in the network.
+        n_synapses: Total number of synapses to generate.
+        min_delay: Minimum connection delay.
+        max_delay: Maximum connection delay.
+        rng: Random number generator. If None, uses default_rng().
 
     Returns:
-        Dict[Tuple[int, int], List[Tuple[float, float]]]: Dictionary of connections where keys are tuples
-        of (source_id, target_id) and values are lists of (delay, weight) tuples.
+        DataFrame with columns: source, target, delay, w0, and w1.
     """
     if rng is None:
         rng = np.random.default_rng()
 
-    total_connections = n_neurons * n_in_per_neuron
-
-    src_ids: npt.NDArray[np.intp] = rng.integers(
-        0, n_neurons, size=total_connections, dtype=np.intp
-    )
-    tgt_ids: npt.NDArray[np.intp] = np.arange(n_neurons, dtype=np.intp).repeat(
-        n_in_per_neuron
-    )
-    delays: npt.NDArray[np.float64] = rng.uniform(
-        min_delay, max_delay, size=total_connections
+    return new_channels(
+        sources=rng.integers(n_neurons, size=n_synapses, dtype=np.intp),
+        targets=rng.integers(n_neurons, size=n_synapses, dtype=np.intp),
+        delays=rng.uniform(min_delay, max_delay, size=n_synapses),
     )
 
-    return build_connections(src_ids, tgt_ids, delays)
 
-
-def rand_connections_fout(
+def rand_synapses_fc(
     n_neurons: int,
-    n_out_per_neuron: int,
     min_delay: float,
     max_delay: float,
     rng: Optional[np.random.Generator] = None,
-) -> Dict[Tuple[int, int], List[Tuple[float, float]]]:
-    """Generate random connections for a neural network, where each neuron has a fixed number of outgoing connections.
+) -> pl.DataFrame:
+    """Generate fully connected random synapses where every neuron connects to every other neuron.
 
     Args:
-        n_neurons (int): Number of neurons in the network
-        n_out_per_neuron (int): Number of outgoing connections per neuron
-        min_delay (float): Minimum connection delay
-        max_delay (float): Maximum connection delay
-        rng (Optional[np.random.Generator]): Random number generator. If None, uses default_rng()
+        n_neurons: Number of neurons in the network.
+        min_delay: Minimum connection delay.
+        max_delay: Maximum connection delay.
+        rng: Random number generator. If None, uses default_rng().
 
     Returns:
-        Dict[Tuple[int, int], List[Tuple[float, float]]]: Dictionary of connections where keys are tuples
-        of (source_id, target_id) and values are lists of (delay, weight) tuples.
+        DataFrame with columns: source, target, delay, w0, and w1.
     """
+
     if rng is None:
         rng = np.random.default_rng()
 
-    total_connections = n_neurons * n_out_per_neuron
+    n_synapses = n_neurons**2
 
-    src_ids: npt.NDArray[np.intp] = np.arange(n_neurons, dtype=np.intp).repeat(
-        n_out_per_neuron
-    )
-    tgt_ids: npt.NDArray[np.intp] = rng.integers(
-        0, n_neurons, size=total_connections, dtype=np.intp
-    )
-    delays: npt.NDArray[np.float64] = rng.uniform(
-        min_delay, max_delay, size=total_connections
+    return new_channels(
+        # sources=np.repeat(np.arange(n_neurons), n_neurons),
+        sources=np.arange(n_synapses) // n_neurons,
+        targets=np.arange(n_synapses) % n_neurons,
+        delays=rng.uniform(min_delay, max_delay, size=n_synapses),
     )
 
-    return build_connections(src_ids, tgt_ids, delays)
 
-
-def rand_connections_fin_fout(
+def rand_synapses_fin(
     n_neurons: int,
-    n_in_out_per_neuron: int,
+    n_synapses: int,
     min_delay: float,
     max_delay: float,
     rng: Optional[np.random.Generator] = None,
-) -> Dict[Tuple[int, int], List[Tuple[float, float]]]:
-    """Generate random connections for a neural network, where each neuron has a fixed number of outgoing connections.
+) -> pl.DataFrame:
+    """Generate random synapses where each neuron has the same number of incoming connections.
 
     Args:
-        n_neurons (int): Number of neurons in the network
-        n_in_out_per_neuron (int): Number of incoming and outgoing connections per neuron
-        min_delay (float): Minimum connection delay
-        max_delay (float): Maximum connection delay
-        rng (Optional[np.random.Generator]): Random number generator. If None, uses default_rng()
+        n_neurons: Number of neurons in the network.
+        n_synapses: Total number of synapses. Must be divisible by n_neurons.
+        min_delay: Minimum connection delay.
+        max_delay: Maximum connection delay.
+        rng: Random number generator. If None, uses default_rng().
 
     Returns:
-        Dict[Tuple[int, int], List[Tuple[float, float]]]: Dictionary of connections where keys are tuples
-        of (source_id, target_id) and values are lists of (delay, weight) tuples.
+        DataFrame with columns: source, target, delay, w0, and w1.
+
+    Raises:
+        ValueError: If n_synapses is not divisible by n_neurons.
     """
+    if n_synapses % n_neurons != 0:
+        raise ValueError("n_synapses must be divisible by n_neurons")
+
     if rng is None:
         rng = np.random.default_rng()
 
-    total_connections = n_neurons * n_in_out_per_neuron
-
-    src_ids: npt.NDArray[np.intp] = np.arange(n_neurons, dtype=np.intp).repeat(
-        n_in_out_per_neuron
-    )
-    np.random.shuffle(src_ids)
-    tgt_ids: npt.NDArray[np.intp] = np.arange(n_neurons, dtype=np.intp).repeat(
-        n_in_out_per_neuron
-    )
-    np.random.shuffle(tgt_ids)
-    delays: npt.NDArray[np.float64] = rng.uniform(
-        min_delay, max_delay, size=total_connections
+    return new_channels(
+        sources=rng.integers(0, n_neurons, size=n_synapses, dtype=np.intp),
+        targets=np.arange(n_synapses) % n_neurons,
+        delays=rng.uniform(min_delay, max_delay, size=n_synapses),
     )
 
-    return build_connections(src_ids, tgt_ids, delays)
+
+def rand_synapses_fout(
+    n_neurons: int,
+    n_synapses: int,
+    min_delay: float,
+    max_delay: float,
+    rng: Optional[np.random.Generator] = None,
+) -> pl.DataFrame:
+    """Generate random synapses where each neuron has the same number of outgoing connections.
+
+    Args:
+        n_neurons: Number of neurons in the network.
+        n_synapses: Total number of synapses. Must be divisible by n_neurons.
+        min_delay: Minimum connection delay.
+        max_delay: Maximum connection delay.
+        rng: Random number generator. If None, uses default_rng().
+
+    Returns:
+        DataFrame with columns: source, target, delay, w0, and w1.
+
+    Raises:
+        ValueError: If n_synapses is not divisible by n_neurons.
+    """
+    if n_synapses % n_neurons != 0:
+        raise ValueError("n_synapses must be divisible by n_neurons")
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    return new_channels(
+        sources=np.arange(n_synapses) % n_neurons,
+        targets=rng.integers(0, n_neurons, size=n_synapses, dtype=np.intp),
+        delays=rng.uniform(min_delay, max_delay, size=n_synapses),
+    )
+
+
+def rand_synapses_fin_fout(
+    n_neurons: int,
+    n_synapses: int,
+    min_delay: float,
+    max_delay: float,
+    rng: Optional[np.random.Generator] = None,
+) -> pl.DataFrame:
+    """Generate random synapses where each neuron has equal incoming and outgoing connections.
+
+    Args:
+        n_neurons: Number of neurons in the network.
+        n_synapses: Total number of synapses. Must be divisible by n_neurons.
+        min_delay: Minimum connection delay.
+        max_delay: Maximum connection delay.
+        rng: Random number generator. If None, uses default_rng().
+
+    Returns:
+        DataFrame with columns: source, target, delay, w0, and w1.
+
+    Raises:
+        ValueError: If n_synapses is not divisible by n_neurons.
+    """
+    if n_synapses % n_neurons != 0:
+        raise ValueError("n_synapses must be divisible by n_neurons")
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    return new_channels(
+        sources=np.arange(n_synapses) % n_neurons,
+        targets=rng.permutation(np.arange(n_synapses) % n_neurons),
+        delays=rng.uniform(min_delay, max_delay, size=n_synapses),
+    )
 
 
 def pmf_n_f_times(
-    period: float, f_rate: float
+    period: float, rate: float
 ) -> Tuple[npt.NDArray[np.intp], npt.NDArray[np.float64]]:
-    """
-    Returns the probability mass function of the number of spikes in a periodic spike train with a given period and firing rate. Note: for numerical stability, the pmf is computed first in the log domain.
+    """Compute probability mass function for number of spikes in a periodic spike train.
+
+    For numerical stability, the PMF is computed in the log domain first.
 
     Args:
-        period (float): the period of the spike train in [tau_0].
-        f_rate (float): the firing rate of the spike train in [1/tau_0].
+        period: Period of the spike train in time units.
+        rate: Firing rate of the spike train in 1/time units.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray]: the support of the pmf and the pmf.
+        Tuple containing:
+            - Support values (number of spikes)
+            - Corresponding probabilities
     """
     ns = np.arange(period, dtype=int)
-    logpns = (ns - 1) * np.log(period - ns) + ns * np.log(f_rate)
+    logpns = (ns - 1) * np.log(period - ns) + ns * np.log(rate)
     logpns[1:] -= np.cumsum(np.log(ns[1:]))
     logpns -= np.max(logpns)  # to avoid overflow when exponentiating
     pns = np.exp(logpns)
     return ns, pns / np.sum(pns)
 
 
-def expected_n_f_times(period: float, f_rate: float) -> float:
-    """
-    Returns the expected number of spikes in a periodic spike train with a given period and firing rate.
+def expected_n_f_times(period: float, rate: float) -> float:
+    """Compute expected number of spikes in a periodic spike train.
 
     Args:
-        period (float): the period of the spike train in [tau_0].
-        f_rate (float): the firing rate of the spike train in [1/tau_0].
+        period: Period of the spike train in time units.
+        rate: Firing rate of the spike train in 1/time units.
 
     Returns:
-        float: the expected number of spikes.
+        Expected number of spikes in one period.
     """
-    ns, pns = pmf_n_f_times(period, f_rate)
+    ns, pns = pmf_n_f_times(period, rate)
     return np.inner(ns, pns)
 
 
-def rand_f_times(
-    n_channels: int,
+# def rand_f_times(
+#     n_neurons: int,
+#     period: float,
+#     rate: float,
+#     rng: Optional[np.random.Generator] = None,
+# ) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.float64]]:
+#     """
+#     Returns a random multi-channel periodic spike train.
+
+#     Args:
+#         period (float): The cycle period of the spike train.
+#         rate (float): The firing rate of the spike train.
+#         n_neurons (int): The number of channels / neurons.
+#         rng (np.random.Generator, optional): The random number generator. If None, uses default_rng()
+
+#     Raises:
+#         ValueError: If the period is negative.
+#         ValueError: If the firing rate is negative.
+
+#     Returns:
+#         (List[npt.NDArray[np.float64]]): a multi-channel periodic spike train.
+#     """
+#     if period < 0.0:
+#         raise ValueError(f"The period should be non-negative.")
+
+#     if rate < 0.0:
+#         raise ValueError(f"The firing rate should be non-negative.")
+
+#     if period <= REFRACTORY_PERIOD or rate == 0.0:
+#         return np.array([]), np.array([])
+
+#     if rng is None:
+#         rng = np.random.default_rng()
+
+#     multi_f_times = []
+#     multi_f_sources = []
+
+#     ns, pns = pmf_n_f_times(period, rate)
+
+#     for c in range(n_channels):
+#         # Sample the number of spikes in [0, period)
+#         n = rng.choice(ns, p=pns)
+#         if n > 0:
+#             multi_f_sources.append(np.full(n, c, dtype=np.intp))
+
+#             # sample the effective poisson process in [0, period-n)
+#             f_times = np.full(n, rng.uniform(0, period))
+#             f_times[1:] += np.sort(rng.uniform(0, period - n, n - 1)) + np.arange(1, n)
+
+#             # transform the effective poisson process into a periodic spike train ...
+#             multi_f_times.append(f_times % period)
+#         # else:
+#         #     multi_f_times.append(np.array([]))
+
+#     return np.concatenate(multi_f_sources), np.concatenate(multi_f_times)
+
+
+def rand_spikes(
+    n_neurons: int,
     period: float,
-    f_rate: float,
+    rate: float,
     rng: Optional[np.random.Generator] = None,
-) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.float64]]:
-    """
-    Returns a random multi-channel periodic spike train.
+) -> pl.DataFrame:
+    """Generate random multi-channel periodic spike trains.
+
+    Creates random spike trains for multiple neurons following a Poisson process
+    within each period, ensuring proper refractory period constraints.
 
     Args:
-        period (float): The cycle period of the spike train.
-        f_rate (float): The firing rate of the spike train.
-        n_channels (int): The number of channels / neurons.
-        rng (np.random.Generator, optional): The random number generator. If None, uses default_rng()
-
-    Raises:
-        ValueError: If the period is negative.
-        ValueError: If the firing rate is negative.
+        n_neurons: Number of neurons/channels.
+        period: Period duration of the spike train.
+        rate: Average firing rate per neuron.
+        rng: Random number generator. If None, uses default_rng().
 
     Returns:
-        (List[npt.NDArray[np.float64]]): a multi-channel periodic spike train.
+        DataFrame with columns: neuron, time, period.
+
+    Raises:
+        ValueError: If period or rate is negative.
     """
     if period < 0.0:
         raise ValueError(f"The period should be non-negative.")
 
-    if f_rate < 0.0:
+    if rate < 0.0:
         raise ValueError(f"The firing rate should be non-negative.")
 
-    if period <= REFRACTORY_PERIOD or f_rate == 0.0:
-        return np.array([]), np.array([])
+    if period <= REFRACTORY_PERIOD or rate == 0.0:
+        return pl.DataFrame(
+            schema={"neuron": pl.UInt32, "time": pl.Float64, "period": pl.Float64}
+        )
 
     if rng is None:
         rng = np.random.default_rng()
 
-    multi_f_times = []
-    multi_f_sources = []
+    f_times = []
+    f_sources = []
 
-    ns, pns = pmf_n_f_times(period, f_rate)
+    ns, pns = pmf_n_f_times(period, rate)
 
-    for c in range(n_channels):
+    for l in range(n_neurons):
         # Sample the number of spikes in [0, period)
         n = rng.choice(ns, p=pns)
         if n > 0:
-            multi_f_sources.append(np.full(n, c, dtype=np.intp))
-            
+            f_sources.append(np.full(n, l, dtype=np.intp))
+
             # sample the effective poisson process in [0, period-n)
-            f_times = np.full(n, rng.uniform(0, period))
-            f_times[1:] += np.sort(rng.uniform(0, period - n, n - 1)) + np.arange(1, n)
+            new_f_times = np.full(n, rng.uniform(0, period))
+            new_f_times[1:] += np.sort(rng.uniform(0, period - n, n - 1)) + np.arange(
+                1, n
+            )
 
             # transform the effective poisson process into a periodic spike train ...
-            multi_f_times.append(f_times % period)
+            f_times.append(new_f_times % period)
         # else:
         #     multi_f_times.append(np.array([]))
 
-    return np.concatenate(multi_f_sources), np.concatenate(multi_f_times)
+    if len(f_times) == 0:
+        return pl.DataFrame(
+            schema={"neuron": pl.UInt32, "time": pl.Float64, "period": pl.Float64}
+        )
+
+    return pl.DataFrame(
+        {
+            "neuron": np.concatenate(f_sources),
+            "time": np.concatenate(f_times),
+            "period": period,
+        },
+        schema={"neuron": pl.UInt32, "time": pl.Float64, "period": pl.Float64},
+    )
 
 
 def rand_jit_f_times(
@@ -248,32 +352,32 @@ def rand_jit_f_times(
     n_iter: int = 1000,
     rng: Optional[np.random.Generator] = None,
 ) -> npt.NDArray[np.float64]:
-    """
-    Returns a (Gaussian) jittered version of the given spike train.
-    It uses the Gibbs sampler.
-    A sorted copy of the firing times is jittered iteratively, alternating between even and odd indices to ensure that the refractory period is respected everywhere.
+    """Generate jittered version of spike train using Gibbs sampling.
+
+    Applies Gaussian jitter to firing times while respecting refractory period
+    constraints. Uses alternating sampling of even/odd indices to maintain
+    temporal ordering.
 
     Args:
-        spike_train (npt.NDArray[np.float64]): the nominal firing locations
-        std_jitter (float): the standard deviation of the Gaussian jitter noise
-        tmin (float, optional): the lower bound of the time range. Defaults to -np.inf
-        tmax (float, optional): the upper bound of the time range. Defaults to np.inf
-        n_iter (int, optional): the maximum number of iterations. Defaults to 1000
-        rng (np.random.Generator, optional): the random number generator. If None, uses default_rng()
-
-    Raises:
-        ValueError: If the firing times are not in the range [start, end].
-
+        f_times: Original firing times to be jittered.
+        std_jitter: Standard deviation of Gaussian jitter noise.
+        start: Lower bound of allowed time range.
+        end: Upper bound of allowed time range.
+        n_iter: Maximum number of Gibbs sampling iterations.
+        rng: Random number generator. If None, uses default_rng().
 
     Returns:
-        npt.NDArray[np.float64]: the jittered spike train
+        Jittered firing times maintaining refractory constraints.
+
+    Raises:
+        ValueError: If firing times are outside [start, end] range.
     """
     if f_times.min(initial=np.inf) < start or f_times.max(initial=-np.inf) > end:
         raise ValueError(
             f"The firing times should be in the range [{start}, {end}]. "
             f"Got [{f_times.min()}, {f_times.max()}]."
         )
-    
+
     sampler = lambda a_, b_, loc_: truncnorm.rvs(
         (a_ - loc_) / std_jitter,
         (b_ - loc_) / std_jitter,
@@ -282,7 +386,7 @@ def rand_jit_f_times(
         random_state=rng or np.random.default_rng(),
     )
 
-    jit_f_times = np.sort(f_times) # make a sorted copy of the firing times
+    jit_f_times = np.sort(f_times)  # make a sorted copy of the firing times
 
     if jit_f_times.size > 1:
         tmin = np.full(jit_f_times.size, start)
@@ -295,7 +399,9 @@ def rand_jit_f_times(
             # fix odd indices and sample the even ones
             tmin[1:] = jit_f_times[:-1] + REFRACTORY_PERIOD
             tmax[:-1] = jit_f_times[1:] - REFRACTORY_PERIOD
-            print(f"Sampling even indices around {jit_f_times[even]} within {tmin[even]} -- {tmax[even]}")
+            print(
+                f"Sampling even indices around {jit_f_times[even]} within {tmin[even]} -- {tmax[even]}"
+            )
             jit_f_times[even] = sampler(
                 tmin[even],
                 tmax[even],
@@ -305,7 +411,9 @@ def rand_jit_f_times(
             # fix even indices and sample odd ones
             tmin[1:] = jit_f_times[:-1] + REFRACTORY_PERIOD
             tmax[:-1] = jit_f_times[1:] - REFRACTORY_PERIOD
-            print(f"Sampling odd indices around {jit_f_times[odd]} within {tmin[odd]} -- {tmax[odd]}")
+            print(
+                f"Sampling odd indices around {jit_f_times[odd]} within {tmin[odd]} -- {tmax[odd]}"
+            )
             jit_f_times[odd] = sampler(
                 tmin[odd],
                 tmax[odd],
