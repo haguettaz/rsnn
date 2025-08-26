@@ -24,7 +24,7 @@ def compute_phi_matrix(A, n_spikes):
 def compute_phi_eigenvals(spikes, synapses, k=3):
     # Spikes is a dataframe with columns: index, period, neuron, origin, time, prev_time
     # Synapses is a dataframe with columns: source, target, delay, weight
-    # States is a dataframe with columns: f_index_source, f_index_target, f_time_in_target (=f_time_out_source + delay), f_time_out_target, w0, w1 (index, period, f_time_out_source, and delay are optional)
+    # States is a dataframe with columns: f_index_source, f_index_target, f_time_in_target (=f_time_out_source + delay), f_time_out_target, weight_0, weight_1 (index, period, f_time_out_source, and delay are optional)
     phis = {}
     for (i,), spikes_i in spikes.partition_by(
         "index", include_key=False, as_dict=True
@@ -46,8 +46,8 @@ def compute_phi_eigenvals(spikes, synapses, k=3):
             pl.col("f_index").alias("f_index_target"),
             pl.col("time_prev").alias("f_time_in_target"),
             pl.col("time").alias("f_time_out_target"),
-            pl.lit(REFRACTORY_RESET, pl.Float64).alias("w0"),
-            pl.lit(0.0, pl.Float64).alias("w1"),
+            pl.lit(REFRACTORY_RESET, pl.Float64).alias("weight_0"),
+            pl.lit(0.0, pl.Float64).alias("weight_1"),
         ).select(
             "source",
             "target",
@@ -55,8 +55,8 @@ def compute_phi_eigenvals(spikes, synapses, k=3):
             "f_index_target",
             "f_time_in_target",
             "f_time_out_target",
-            "w0",
-            "w1",
+            "weight_0",
+            "weight_1",
         )
 
         ## Synaptic transmission
@@ -91,8 +91,8 @@ def compute_phi_eigenvals(spikes, synapses, k=3):
             "f_index_target",
             "f_time_in_target",
             "f_time_out_target",
-            "w0",
-            "w1",
+            "weight_0",
+            "weight_1",
         )
 
         # Merge and sort (grouped by neuron)
@@ -109,7 +109,11 @@ def compute_phi_eigenvals(spikes, synapses, k=3):
         # Aggregate states for spike to spike contributions
         agg_states = states.group_by(["f_index_source", "f_index_target"]).agg(
             (
-                (pl.col("w1") - pl.col("w0") - pl.col("w1") * pl.col("delta"))
+                (
+                    pl.col("weight_1")
+                    - pl.col("weight_0")
+                    - pl.col("weight_1") * pl.col("delta")
+                )
                 * (-pl.col("delta")).exp()
             )
             .sum()

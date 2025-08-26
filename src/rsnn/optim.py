@@ -3,13 +3,13 @@ from collections import defaultdict
 import gurobipy as gp
 import polars as pl
 from scipy import sparse
-from tqdm import trange
 
-from .channels import new_channels, transfer_through_channels
-from .constants import FIRING_THRESHOLD, REFRACTORY_PERIOD, REFRACTORY_RESET
+import rsnn_plugin as rp
+
+from .constants import FIRING_THRESHOLD, REFRACTORY_RESET
 from .log import setup_logging
 from .spikes import *
-from .states import compute_maxima, update_coef, update_length
+from .states import compute_maxima
 
 logger = setup_logging(__name__, console_level="DEBUG", file_level="INFO")
 
@@ -28,8 +28,8 @@ STATES_COLS = [
     "length",
     "reset",
     "in_index",
-    "w0",
-    "w1",
+    "weight_0",
+    "weight_1",
     "active",
 ]
 
@@ -39,10 +39,10 @@ def create_recovery_states(spikes):
         pl.lit(None, pl.Boolean).alias("active"),
         pl.lit(None, pl.UInt32).alias("in_index"),
         pl.col("time").alias("start"),
-        pl.lit(REFRACTORY_RESET, pl.Float64).alias("w0"),
-        pl.lit(0.0, pl.Float64).alias("w1"),
-        pl.lit(REFRACTORY_RESET, pl.Float64).alias("c0"),
-        pl.lit(0.0, pl.Float64).alias("c1"),
+        pl.lit(REFRACTORY_RESET, pl.Float64).alias("weight_0"),
+        pl.lit(0.0, pl.Float64).alias("weight_1"),
+        pl.lit(REFRACTORY_RESET, pl.Float64).alias("coef_0"),
+        pl.lit(0.0, pl.Float64).alias("coef_1"),
     ).select(
         "index",
         "neuron",
@@ -50,10 +50,10 @@ def create_recovery_states(spikes):
         "active",
         "start",
         "in_index",
-        "w0",
-        "w1",
-        "c0",
-        "c1",
+        "weight_0",
+        "weight_1",
+        "coef_0",
+        "coef_1",
     )
 
 
@@ -70,8 +70,8 @@ def create_synaptic_states(spikes, synapses, origins):
                 pl.col("period"),
                 pl.col("time_origin"),
             ).alias("start"),
-            pl.lit(None, pl.Float64).alias("c0"),
-            pl.lit(None, pl.Float64).alias("c1"),
+            pl.lit(None, pl.Float64).alias("coef_0"),
+            pl.lit(None, pl.Float64).alias("coef_1"),
         )
         .select(
             "index",
@@ -80,10 +80,10 @@ def create_synaptic_states(spikes, synapses, origins):
             "active",
             "start",
             "in_index",
-            "w0",
-            "w1",
-            "c0",
-            "c1",
+            "weight_0",
+            "weight_1",
+            "coef_0",
+            "coef_1",
         )
     )
 
@@ -123,19 +123,19 @@ def create_offline_states(spikes, synapses, eps=0.2):
         pl.lit(True, pl.Boolean).alias("active"),
         pl.lit(None, pl.UInt32).alias("in_index"),
         pl.col("time").alias("start"),
-        pl.lit(0.0, pl.Float64).alias("w0"),
-        pl.lit(0.0, pl.Float64).alias("w1"),
-        pl.lit(None, pl.Float64).alias("c0"),
-        pl.lit(None, pl.Float64).alias("c1"),
+        pl.lit(0.0, pl.Float64).alias("weight_0"),
+        pl.lit(0.0, pl.Float64).alias("weight_1"),
+        pl.lit(None, pl.Float64).alias("coef_0"),
+        pl.lit(None, pl.Float64).alias("coef_1"),
     )
     v_states_2 = spikes.with_columns(
         pl.lit(True, pl.Boolean).alias("active"),
         pl.lit(None, pl.UInt32).alias("in_index"),
         (pl.col("time") - eps).clip(pl.col("time_prev")).alias("start"),
-        pl.lit(0.0, pl.Float64).alias("w0"),
-        pl.lit(0.0, pl.Float64).alias("w1"),
-        pl.lit(None, pl.Float64).alias("c0"),
-        pl.lit(None, pl.Float64).alias("c1"),
+        pl.lit(0.0, pl.Float64).alias("weight_0"),
+        pl.lit(0.0, pl.Float64).alias("weight_1"),
+        pl.lit(None, pl.Float64).alias("coef_0"),
+        pl.lit(None, pl.Float64).alias("coef_1"),
     )
     v_states = pl.concat([v_states_1, v_states_2]).select(
         "index",
@@ -144,13 +144,13 @@ def create_offline_states(spikes, synapses, eps=0.2):
         "active",
         "start",
         "in_index",
-        "w0",
-        "w1",
-        "c0",
-        "c1",
+        "weight_0",
+        "weight_1",
+        "coef_0",
+        "coef_1",
     )
 
-    # Merge and sort (grouped by index and neuron)
+    # Merge and sort
     states = pl.concat([rec_states, syn_states, v_states])
     states = states.sort(["start", "f_index"])
     states = states.with_columns(
@@ -159,7 +159,9 @@ def create_offline_states(spikes, synapses, eps=0.2):
     states = states.with_columns(
         pl.col("active").forward_fill().fill_null(False).over("f_index")
     )
-    states = update_length(states, over="f_index", fill_value=0.0)
+    states = states.with_columns(
+        pl.col("start").diff().shift(-1, fill_value=0.0).over("f_index").alias("length")
+    )
 
     return spikes, synapses, states
 
@@ -176,8 +178,8 @@ def optimize_offline(
     feas_tol=1e-5,
 ):
     # spikes is a dataframe with columns: index, period, neuron, time, time_prev
-    # synapses is a dataframe with columns: in_index, source, target, delay, w0, w1
-    # states is a dataframe with columns: index, neuron, active, start, length, in_index, w0, w1, c0, c1
+    # synapses is a dataframe with columns: in_index, source, target, delay, weight_0, weight_1
+    # states is a dataframe with columns: index, neuron, active, start, length, in_index, weight_0, weight_1, coef_0, coef_1
 
     if zmax > FIRING_THRESHOLD:
         raise ValueError("zmax must be less than or equal to the firing threshold.")
@@ -223,7 +225,7 @@ def optimize_offline(
             model.addConstr(A @ weights + b <= zmax)  # silent area: z <= zmax
 
         states_active = states.filter(pl.col("active")).with_columns(
-            (pl.col("c0") - pl.col("c1")).alias("c0")
+            (pl.col("coef_0") - pl.col("coef_1")).alias("coef_0")
         )
         max_violations_active = compute_maxima(
             states_active, feas_tol - dzmin, k=1, by="f_index"
@@ -260,7 +262,7 @@ def compute_linear_cstr(times, states, n_synapses, deriv=0):
     rec_lin_offset = (
         times.join(
             states.filter(pl.col("in_index").is_null()).select(
-                "f_index", "start", "w0", "w1"
+                "f_index", "start", "weight_0", "weight_1"
             ),
             on="f_index",
             how="left",
@@ -290,7 +292,11 @@ def compute_linear_cstr(times, states, n_synapses, deriv=0):
     if deriv % 2 == 0:
         rec_lin_offset = rec_lin_offset.agg(
             (
-                (pl.col("w0") - deriv * pl.col("w1") + pl.col("w1") * pl.col("delta"))
+                (
+                    pl.col("weight_0")
+                    - deriv * pl.col("weight_1")
+                    + pl.col("weight_1") * pl.col("delta")
+                )
                 * (-pl.col("delta")).exp()
             )
             .sum()
@@ -302,7 +308,11 @@ def compute_linear_cstr(times, states, n_synapses, deriv=0):
     else:
         rec_lin_offset = rec_lin_offset.agg(
             (
-                (deriv * pl.col("w1") - pl.col("w0") - pl.col("w1") * pl.col("delta"))
+                (
+                    deriv * pl.col("weight_1")
+                    - pl.col("weight_0")
+                    - pl.col("weight_1") * pl.col("delta")
+                )
                 * (-pl.col("delta")).exp()
             )
             .sum()
@@ -330,7 +340,7 @@ def compute_linear_cstr(times, states, n_synapses, deriv=0):
 def update_synapses_from_weights(synapses, weights):
     # update synapses with given weights
     return synapses.update(
-        pl.DataFrame({"w1": weights}).with_row_index("in_index"),
+        pl.DataFrame({"weight_1": weights}).with_row_index("in_index"),
         on="in_index",
     )
 
@@ -338,9 +348,24 @@ def update_synapses_from_weights(synapses, weights):
 def update_states_from_weights(states, weights):
     # update synaptic states from given weights
     states = states.update(
-        pl.DataFrame({"w1": weights}).with_row_index("in_index"),
+        pl.DataFrame({"weight_1": weights}).with_row_index("in_index"),
         on="in_index",
     )
 
-    states = update_coef(states, over="f_index")
+    states = states.with_columns(
+        rp.scan_coef_1(pl.col("length").shift(), pl.col("weight_1"))
+        .over("f_index")
+        .alias("coef_1")
+    )
+    states = states.with_columns(
+        rp.scan_coef_0(
+            pl.col("length").shift(),
+            pl.col("coef_1").shift(),
+            pl.col("weight_0"),
+        )
+        .over("f_index")
+        .alias("coef_0")
+    )
+
+    # states = update_coef(states, over="f_index")
     return states

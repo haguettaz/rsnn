@@ -11,8 +11,8 @@ SCHEMA = {
     "source": pl.UInt32,
     "target": pl.UInt32,
     "delay": pl.Float64,
-    "w0": pl.Float64,
-    "w1": pl.Float64,
+    "weight_0": pl.Float64,
+    "weight_1": pl.Float64,
 }
 
 
@@ -20,24 +20,24 @@ def new_channels(
     sources: NDArray[np.intp],
     targets: NDArray[np.intp],
     delays: NDArray[np.float64] | float = 0.0,
-    w0: NDArray[np.float64] | float = 0.0,
-    w1: NDArray[np.float64] | float = 0.0,
+    weight_0: NDArray[np.float64] | float = 0.0,
+    weight_1: NDArray[np.float64] | float = 0.0,
 ):
     data = {
         "source": sources,
         "target": targets,
         "delay": delays,
-        "w0": w0,
-        "w1": w1,
+        "weight_0": weight_0,
+        "weight_1": weight_1,
     }
 
     return pl.DataFrame(data, SCHEMA)
 
 
 def create_channels(n_neurons, synapses):
-    synapses = synapses.select("source", "target", "delay", "w0", "w1")
+    synapses = synapses.select("source", "target", "delay", "weight_0", "weight_1")
     recovery = new_channels(
-        np.arange(n_neurons), np.arange(n_neurons), w0=REFRACTORY_RESET
+        np.arange(n_neurons), np.arange(n_neurons), weight_0=REFRACTORY_RESET
     )
     return synapses.extend(recovery)
 
@@ -92,8 +92,8 @@ def transfer_through_channels(spikes, channels, time_str, sort=False):
     states = states.with_columns(
         (pl.col("time") + pl.col("delay")).alias(time_str),
         # pl.lit(None, pl.Float64).alias("length"),
-        # pl.lit(None, pl.Float64).alias("c0"),
-        # pl.lit(None, pl.Float64).alias("c1"),
+        # pl.lit(None, pl.Float64).alias("coef_0"),
+        # pl.lit(None, pl.Float64).alias("coef_1"),
     )
     # states = states.drop("target", "delay", "time")
     if sort:
