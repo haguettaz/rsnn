@@ -1,6 +1,6 @@
 import numpy as np
 
-from rsnn.learning.gmp import GMPModel
+from rsnn.optim.gmp import GMPModel
 
 
 def test_solver_initialization():
@@ -33,6 +33,7 @@ def test_solver_initialization():
     assert np.isnan(solver.primal_cost)
     assert solver.xt.shape == (7,)
     assert solver.x.shape == (42,)
+
 
 def test_solver_solve():
     np.random.seed(42)  # For reproducibility

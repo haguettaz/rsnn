@@ -1,6 +1,6 @@
 import numpy as np
 
-from rsnn.learning.grb import GRBModel
+from rsnn.optim.grb import GRBModel
 
 
 def test_solver_initialization():

@@ -1,6 +1,6 @@
 import numpy as np
 
-from rsnn.learning.utils import *
+from rsnn.optim.utils import *
 
 
 def test_modulo_with_offset():

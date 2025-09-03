@@ -1,6 +1,6 @@
 import numpy as np
 
-from rsnn.jitters import compute_phi
+from rsnn.optim.jitters import compute_phi
 
 
 def test_compute_phi():
