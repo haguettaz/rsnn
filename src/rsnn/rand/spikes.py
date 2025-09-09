@@ -46,63 +46,6 @@ def expected_n_f_times(period: float, rate: float) -> float:
     return np.inner(ns, pns)
 
 
-# def rand_f_times(
-#     n_neurons: int,
-#     period: float,
-#     rate: float,
-#     rng: Optional[np.random.Generator] = None,
-# ) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.float64]]:
-#     """
-#     Returns a random multi-channel periodic spike train.
-
-#     Args:
-#         period (float): The cycle period of the spike train.
-#         rate (float): The firing rate of the spike train.
-#         n_neurons (int): The number of channels / neurons.
-#         rng (np.random.Generator, optional): The random number generator. If None, uses default_rng()
-
-#     Raises:
-#         ValueError: If the period is negative.
-#         ValueError: If the firing rate is negative.
-
-#     Returns:
-#         (List[npt.NDArray[np.float64]]): a multi-channel periodic spike train.
-#     """
-#     if period < 0.0:
-#         raise ValueError(f"The period should be non-negative.")
-
-#     if rate < 0.0:
-#         raise ValueError(f"The firing rate should be non-negative.")
-
-#     if period <= REFRACTORY_PERIOD or rate == 0.0:
-#         return np.array([]), np.array([])
-
-#     if rng is None:
-#         rng = np.random.default_rng()
-
-#     multi_f_times = []
-#     multi_f_sources = []
-
-#     ns, pns = pmf_n_f_times(period, rate)
-
-#     for c in range(n_channels):
-#         # Sample the number of spikes in [0, period)
-#         n = rng.choice(ns, p=pns)
-#         if n > 0:
-#             multi_f_sources.append(np.full(n, c, dtype=np.intp))
-
-#             # sample the effective poisson process in [0, period-n)
-#             f_times = np.full(n, rng.uniform(0, period))
-#             f_times[1:] += np.sort(rng.uniform(0, period - n, n - 1)) + np.arange(1, n)
-
-#             # transform the effective poisson process into a periodic spike train ...
-#             multi_f_times.append(f_times % period)
-#         # else:
-#         #     multi_f_times.append(np.array([]))
-
-#     return np.concatenate(multi_f_sources), np.concatenate(multi_f_times)
-
-
 def rand_spikes(
     n_neurons: int,
     periods: List[float],

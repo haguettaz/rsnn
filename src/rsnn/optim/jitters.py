@@ -1,7 +1,6 @@
 import numpy as np
 import polars as pl
 import scipy.sparse as ss
-from numba import njit
 
 from rsnn import REFRACTORY_RESET
 from rsnn.log import setup_logging
@@ -9,14 +8,6 @@ from rsnn.optim.utils import modulo_with_offset
 
 # Set up logging
 logger = setup_logging(__name__, console_level="DEBUG", file_level="INFO")
-
-
-# @njit
-# def a_to_Phi(a, n_spikes):
-#     Phi = np.identity(n_spikes, dtype=np.float64)
-#     for n in range(n_spikes):
-#         Phi[n] = a[n] @ Phi
-#     return Phi
 
 
 def compute_Phi(synapses, spikes):
@@ -138,11 +129,3 @@ def compute_jitters_eigenvalues(synapses, spikes):
         eigenvalues[i] = np.linalg.eigvals(Phi - 1 / Phi.shape[0])
 
     return eigenvalues
-
-
-# def compute_non_global_phi_eigenvals(Phi, k=3):
-#     return ss.linalg.eigs(Phi - 1 / Phi.shape[0], k=k, return_eigenvectors=False)
-
-
-# def compute_global_drift(Phi):
-#     return ss.linalg.eigs(Phi, k=1, sigma=1.0)

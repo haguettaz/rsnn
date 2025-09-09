@@ -11,61 +11,6 @@ from rsnn.log import setup_logging
 logger = setup_logging(__name__, console_level="DEBUG", file_level="DEBUG")
 
 
-# def add_spikes(spikes):
-#     """Initialize spikes with: previous firing time (with periodic extension) and (unique) firing time index. The resulting spikes are sorted by 1) index and 2) time."""
-#     if "index" in spikes.columns:
-#         return spikes.sort("index", "time").with_columns(
-#             pl.int_range(pl.len(), dtype=pl.UInt32).alias("f_index"),
-#             modulo_with_offset(
-#                 pl.col("time").gather((pl.int_range(pl.len()) - 1) % pl.len()),
-#                 pl.col("period"),
-#                 pl.col("time") - pl.col("period"),
-#             )
-#             .over(["index", "neuron"])
-#             .alias("time_prev"),
-#         )
-
-#     return spikes.sort("time").with_columns(
-#         pl.int_range(pl.len(), dtype=pl.UInt32).alias("f_index"),
-#         modulo_with_offset(
-#             pl.col("time").gather((pl.int_range(pl.len()) - 1) % pl.len()),
-#             pl.col("period"),
-#             pl.col("time") - pl.col("period"),
-#         )
-#         .over("neuron")
-#         .alias("time_prev"),
-#     )
-
-
-# def init_spikes(spikes, periods):
-#     """Add memory index, previous firing time (with periodic extension) and (unique) firing time index to spikes. The resulting spikes are sorted by 1) index and 2) time."""
-#     if ("index" in spikes.columns) != ("index" in periods.columns):
-#         raise ValueError(
-#             "spikes and periods must both contain or both not contain the index column."
-#         )
-
-#     if "index" not in spikes.columns:
-#         spikes = spikes.with_columns(pl.lit(0, pl.UInt32).alias("index"))
-#         periods = periods.with_columns(pl.lit(0, pl.UInt32).alias("index"))
-
-#     spikes = (
-#         spikes.sort("index", "time")
-#         .join(periods, on="index")
-#         .with_columns(
-#             pl.int_range(pl.len(), dtype=pl.UInt32).alias("f_index"),
-#             modulo_with_offset(
-#                 pl.col("time").gather((pl.int_range(pl.len()) - 1) % pl.len()),
-#                 pl.col("period"),
-#                 pl.col("time") - pl.col("period"),
-#             )
-#             .over(["index", "neuron"])
-#             .alias("time_prev"),
-#         )
-#     )
-
-#     return spikes, periods
-
-
 def init_synapses(synapses, spikes):
     """Prune synapses to keep only those that have a source neuron that spikes at least once. Add unique in_index to each synapse.
 
@@ -183,74 +128,6 @@ def scan_states(states):
     )
 
 
-# def compute_in_states(synapses, out_spikes, source_spikes, periods):
-#     """Returns:
-#     - out_spikes: spikes of the post-synaptic neurons (with index, f_index, time_prev)
-#     - synapses: synapses with unique in_index
-#     - in_states: input states with (f_index, start, in_index, weight, in_coef_0, in_coef_1). Completely determine the fading traces at any time.
-#     """
-#     # Refractoriness
-#     rec_states = out_spikes.select(
-#         pl.col("index"),
-#         pl.col("f_index"),
-#         pl.col("time_prev").alias("start"),
-#         pl.lit(None, pl.UInt32).alias("in_index"),
-#         pl.lit(REFRACTORY_RESET, pl.Float64).alias("weight"),
-#         pl.lit(1.0, pl.Float64).alias("in_coef_0"),
-#         pl.lit(0.0, pl.Float64).alias("in_coef_1"),
-#     )
-
-#     # Synaptic transmission
-#     origins = out_spikes.group_by("index").agg(pl.min("time_prev").alias("time_origin"))
-#     syn_states = (
-#         synapses.join(source_spikes, left_on="source", right_on="neuron")
-#         .join(origins, on="index")
-#         .join(periods, on="index")
-#         .select(
-#             pl.col("index"),
-#             pl.lit(None, pl.UInt32).alias("f_index"),
-#             modulo_with_offset(
-#                 pl.col("time") + pl.col("delay"),
-#                 pl.col("period"),
-#                 pl.col("time_origin"),
-#             ).alias("start"),
-#             pl.col("in_index"),
-#             pl.col("weight"),
-#             pl.lit(0.0, pl.Float64).alias("in_coef_0"),
-#             pl.lit(1.0, pl.Float64).alias("in_coef_1"),
-#         )
-#     )
-
-#     # Merge input states (refractoriness + synapses) and complete f_index information
-#     in_states = syn_states.extend(rec_states).select(
-#         pl.col("f_index").forward_fill().over("index", order_by="start"),
-#         pl.col("start"),
-#         pl.col("in_index"),
-#         pl.col("weight"),
-#         pl.col("in_coef_0"),
-#         pl.col("in_coef_1"),
-#     )
-
-#     return in_states
-
-
-# def scan_coef(states, over):
-#     """WARNING: states must be sorted by start in the grouping provided by over."""
-#     return states.with_columns(
-#         rp.scan_coef_1(pl.col("length").shift(), pl.col("coef_1"))
-#         .over(over)
-#         .alias("scan_coef_1")
-#     ).with_columns(
-#         rp.scan_coef_0(
-#             pl.col("length").shift(),
-#             pl.col("scan_coef_1").shift(),
-#             pl.col("coef_0"),
-#         )
-#         .over(over)
-#         .alias("scan_coef_0")
-#     )
-
-
 def compute_linear_map(syn_states, rec_states, times, n_synapses, deriv=0):
     times = times.with_row_index("t_index")
 
@@ -306,14 +183,6 @@ def compute_linear_map(syn_states, rec_states, times, n_synapses, deriv=0):
         ),
         rec_offset.sort("t_index").get_column("coef").to_numpy(),
     )
-
-
-# def update_weights(dataframe, weights):
-#     # update synapses with given weights
-#     return dataframe.update(
-#         pl.DataFrame({"weight": weights}).with_row_index("in_index"),
-#         on="in_index",
-#     )
 
 
 def modulo_with_offset(x, period, offset):

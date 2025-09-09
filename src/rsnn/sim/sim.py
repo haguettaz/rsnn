@@ -1,5 +1,3 @@
-from typing import Callable, Optional, Tuple
-
 import numpy as np
 import polars as pl
 from scipy.sparse import csr_array
@@ -8,9 +6,6 @@ from scipy.sparse.csgraph import floyd_warshall
 import rsnn_plugin as rp
 from rsnn import FIRING_THRESHOLD, REFRACTORY_RESET
 from rsnn.log import setup_logging
-
-# from .channels import *
-# from .states import *
 
 logger = setup_logging(__name__, console_level="INFO", file_level="DEBUG")
 
@@ -30,50 +25,6 @@ def filter_new_spikes(new_spikes, min_delays):
     )
     new_spikes = new_spikes.remove(pl.col("time") > pl.col("max_time"))
     return new_spikes.select("neuron", "time")
-
-
-# def extract_next_spikes(states):
-#     """Extract the first next spike per group, e.g., neuron."""
-#     new_spikes = (
-#         states.filter(pl.col("f_time").is_not_nan())
-#         .group_by("neuron")
-#         .agg(pl.min("f_time").alias("time"))
-#     )
-#     return new_spikes
-
-
-# def cleanse_states_recovery(states, neurons):
-#     """Remove all states strictily before the last spike (reset)."""
-#     # Remove all states STRICTLY before the last_f_time (otherwise, problem with recovery mechanism)
-#     return (
-#         states.join(neurons.select("neuron", "last_f_time"), on="neuron", how="left")
-#         .filter(pl.col("start") >= pl.col("last_f_time"))
-#         .drop("last_f_time")
-#     )
-
-
-# def cleanse_states_causal(states, tmin):
-#     states = states.filter(pl.col("start") >= tmin)
-#     return states
-
-
-# def create_recovery_states(spikes):
-#     return spikes.with_columns(
-#         pl.col("time").alias("start"),
-#         pl.lit(REFRACTORY_RESET, pl.Float64).alias("in_coef_0"),
-#         pl.lit(0.0, pl.Float64).alias("in_coef_1"),
-#     )
-
-
-# def create_synaptic_states(spikes, synapses):
-#     return synapses.join(
-#         spikes, left_on="source", right_on="neuron", how="inner"
-#     ).select(
-#         (pl.col("time") + pl.col("delay")).alias("start"),
-#         pl.col("target").alias("neuron"),
-#         pl.lit(0.0, pl.Float64).alias("in_coef_0"),
-#         pl.col("weight").alias("in_coef_1"),
-#     )
 
 
 def filter_spikes(spikes, min_delays):
@@ -107,53 +58,6 @@ def filter_states(states, min_delays, spikes):
         .filter(pl.col("start") <= pl.col("max_time"))
         .drop("max_time")
     )
-
-
-# def update_new_spikes(states, new_spikes, min_delays):
-#     states = compute_f_time(states)
-#     new_spikes = filter_new_spikes(
-#         new_spikes.extend(
-#             states.group_by("neuron").agg(pl.col("f_time").min().alias("time"))
-#         ),
-#         min_delays,
-#     )
-#     return new_spikes
-
-
-# def create_states(
-#     neuron,
-#     start,
-#     length=None,
-#     weight_0=0.0,
-#     weight_1=0.0,
-#     coef_0=None,
-#     coef_1=None,
-#     f_thresh=None,
-#     f_time=None,
-# ):
-#     data = {
-#         "neuron": neuron,
-#         "start": start,
-#         "length": length,
-#         "weight_0": weight_0,
-#         "weight_1": weight_1,
-#         "coef_0": coef_0,
-#         "coef_1": coef_1,
-#         "f_thresh": f_thresh,
-#         "f_time": f_time,
-#     }
-#     schema = {
-#         "neuron": pl.UInt32,
-#         "start": pl.Float64,
-#         "length": pl.Float64,
-#         "weight_0": pl.Float64,
-#         "weight_1": pl.Float64,
-#         "coef_0": pl.Float64,
-#         "coef_1": pl.Float64,
-#         "f_thresh": pl.Float64,
-#         "f_time": pl.Float64,
-#     }
-#     return pl.DataFrame(data, schema)
 
 
 def init_states(spikes, synapses):
@@ -302,17 +206,6 @@ def run(neurons, spikes, synapses, start, end, std_threshold=0.0, rng=None):
             .remove(pl.col("start") < pl.col("time"))
             .drop("time")
         )
-        # states = states.extend(
-        #     rec_states.select(
-        #         "neuron", "start", "weight_0", "weight_1"
-        #     ).match_to_schema(states.schema, missing_columns="insert"),
-        # ).extend(
-        #     syn_states.select(
-        #         "neuron", "start", "weight_0", "weight_1"
-        #     ).match_to_schema(states.schema, missing_columns="insert"),
-        # )
-
-        # states = cleanse_states_recovery(states, neurons)  # reset
 
     logger.info("Simulation completed!")
     return neurons, spikes, states
