@@ -1,1 +1,3 @@
-__version__ = "2.0.0"
+FIRING_THRESHOLD = 1.0
+REFRACTORY_PERIOD = 1.0  # Main unit of time
+REFRACTORY_RESET = 0.0

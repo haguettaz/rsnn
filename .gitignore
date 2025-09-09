@@ -7,6 +7,9 @@ __pycache__/
 .vscode/
 
 
+# Archive files
+archive/
+
 # C extensions
 *.so
 
@@ -136,5 +139,6 @@ dmypy.json
 # MAC OS
 .DS_Store
 
-# Private
-private/
+/private
+
+/private
