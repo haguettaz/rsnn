@@ -39,7 +39,7 @@ def setup_logging(name: str, console_level: str, file_level: str) -> logging.Log
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter(
-        "%(asctime)s.%(msecs)03d' - %(levelname)s - %(message)s",
+        "%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s",
         style="%",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
