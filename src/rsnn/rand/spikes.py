@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -105,8 +105,8 @@ def expected_n_f_times(period: float, rate: float) -> float:
 
 def rand_spikes(
     n_neurons: int,
-    period: float,
-    rate: float,
+    periods: List[float],
+    rates: List[float],
     rng: Optional[np.random.Generator] = None,
 ) -> pl.DataFrame:
     """Generate random multi-channel periodic spike trains.
@@ -126,55 +126,58 @@ def rand_spikes(
     Raises:
         ValueError: If period or rate is negative.
     """
-    if period < 0.0:
-        raise ValueError(f"The period should be non-negative.")
+    if any(period < 0.0 for period in periods):
+        raise ValueError(f"All periods should be non-negative.")
 
-    if rate < 0.0:
-        raise ValueError(f"The firing rate should be non-negative.")
-
-    if period <= REFRACTORY_PERIOD or rate == 0.0:
-        return pl.DataFrame(
-            schema={"neuron": pl.UInt32, "time": pl.Float64, "period": pl.Float64}
-        )
+    if any(rate < 0.0 for rate in rates):
+        raise ValueError(f"All firing rates should be non-negative.")
 
     if rng is None:
         rng = np.random.default_rng()
 
-    f_times = []
-    f_sources = []
-
-    ns, pns = pmf_n_f_times(period, rate)
-
-    for l in range(n_neurons):
-        # Sample the number of spikes in [0, period)
-        n = rng.choice(ns, p=pns)
-        if n > 0:
-            f_sources.append(np.full(n, l, dtype=np.intp))
-
-            # sample the effective poisson process in [0, period-n)
-            new_f_times = np.full(n, rng.uniform(0, period))
-            new_f_times[1:] += np.sort(rng.uniform(0, period - n, n - 1)) + np.arange(
-                1, n
-            )
-
-            # transform the effective poisson process into a periodic spike train ...
-            f_times.append(new_f_times % period)
-        # else:
-        #     multi_f_times.append(np.array([]))
-
-    if len(f_times) == 0:
-        return pl.DataFrame(
-            schema={"neuron": pl.UInt32, "time": pl.Float64, "period": pl.Float64}
-        )
-
-    return pl.DataFrame(
-        {
-            "neuron": np.concatenate(f_sources),
-            "time": np.concatenate(f_times),
-            "period": period,
-        },
-        schema={"neuron": pl.UInt32, "time": pl.Float64, "period": pl.Float64},
+    spikes = pl.DataFrame(
+        schema={
+            "index": pl.UInt32,
+            "neuron": pl.UInt32,
+            "time": pl.Float64,
+            "period": pl.Float64,
+        }
     )
+
+    for i, (period, rate) in enumerate(zip(periods, rates)):
+        if period <= REFRACTORY_PERIOD or rate == 0.0:
+            continue
+
+        ns, pns = pmf_n_f_times(period, rate)
+
+        for l in range(n_neurons):
+            # Sample the number of spikes in [0, period)
+            n = rng.choice(ns, p=pns)
+            if n > 0:
+                # sample the effective poisson process in [0, period-n)
+                new_f_times = np.full(n, rng.uniform(0, period))
+                new_f_times[1:] += np.sort(
+                    rng.uniform(0, period - n, n - 1)
+                ) + np.arange(1, n)
+
+                spikes = spikes.vstack(
+                    pl.DataFrame(
+                        {
+                            "index": i,
+                            "neuron": l,
+                            "time": new_f_times % period,
+                            "period": period,
+                        },
+                        schema={
+                            "index": pl.UInt32,
+                            "neuron": pl.UInt32,
+                            "time": pl.Float64,
+                            "period": pl.Float64,
+                        },
+                    )
+                )
+
+    return spikes.sort(["index", "time"])
 
 
 def rand_jit_f_times(

@@ -9,6 +9,9 @@ __pycache__/
 # Notebook data
 notebooks/data/
 
+# Archive files
+archive/
+
 # C extensions
 *.so
 

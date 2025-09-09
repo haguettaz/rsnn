@@ -314,4 +314,5 @@ def run(neurons, spikes, synapses, start, end, std_threshold=0.0, rng=None):
 
         # states = cleanse_states_recovery(states, neurons)  # reset
 
+    logger.info("Simulation completed!")
     return neurons, spikes, states

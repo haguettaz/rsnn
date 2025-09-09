@@ -5,22 +5,32 @@ from numba import njit
 
 from rsnn import REFRACTORY_RESET
 from rsnn.log import setup_logging
-from rsnn.optim.utils import init_spikes, modulo_with_offset
+from rsnn.optim.utils import modulo_with_offset
 
 # Set up logging
 logger = setup_logging(__name__, console_level="DEBUG", file_level="INFO")
 
 
-@njit
-def a_to_Phi(a, n_spikes):
-    Phi = np.identity(n_spikes, dtype=np.float64)
-    for n in range(n_spikes):
-        Phi[n] = a[n] @ Phi
-    return Phi
+# @njit
+# def a_to_Phi(a, n_spikes):
+#     Phi = np.identity(n_spikes, dtype=np.float64)
+#     for n in range(n_spikes):
+#         Phi[n] = a[n] @ Phi
+#     return Phi
 
 
-def compute_Phi(spikes, synapses):
-    spikes = init_spikes(spikes)
+def compute_Phi(synapses, spikes):
+    # Init spikes with f_index and time_prev
+    spikes = spikes.sort("time").with_columns(
+        pl.int_range(pl.len(), dtype=pl.UInt32).alias("f_index"),
+        modulo_with_offset(
+            pl.col("time").gather((pl.int_range(pl.len()) - 1) % pl.len()),
+            pl.col("period"),
+            pl.col("time") - pl.col("period"),
+        )
+        .over("neuron")
+        .alias("time_prev"),
+    )
 
     ## Refractoriness
     rec_states = spikes.select(
@@ -39,7 +49,7 @@ def compute_Phi(spikes, synapses):
 
     ## Synaptic transmission
     # Compute origins for each neuron
-    origins = spikes.group_by("neuron").agg(pl.min("time_prev").alias("time_origin"))
+    origins = spikes.group_by("neuron").agg(pl.first("time_prev").alias("time_origin"))
 
     # Create synaptic states
     syn_states = (
@@ -72,60 +82,60 @@ def compute_Phi(spikes, synapses):
     )
 
     # Aggregate states for spike to spike contributions
-    agg_states = states.group_by(["f_index_source", "f_index_target"]).agg(
-        (
+    agg_states = (
+        states.group_by(["f_index_source", "f_index_target"])
+        .agg(
             (
-                pl.col("in_coef_1")
-                - pl.col("in_coef_0")
-                - pl.col("in_coef_1") * pl.col("time_source_to_target")
+                (
+                    pl.col("in_coef_1")
+                    - pl.col("in_coef_0")
+                    - pl.col("in_coef_1") * pl.col("time_source_to_target")
+                )
+                * (-pl.col("time_source_to_target")).exp()
             )
-            * (-pl.col("time_source_to_target")).exp()
+            .sum()
+            .alias("coef")
         )
-        .sum()
-        .alias("coef")
+        .sort("f_index_target")
     )
 
-    # Build linear propagation operator
-    a = ss.csr_array(
-        (
-            agg_states["coef"].to_numpy(),
-            (
-                agg_states["f_index_target"].to_numpy(),
-                agg_states["f_index_source"].to_numpy(),
-            ),
-        ),
-    ).todense()
-    a /= np.sum(a, axis=1, keepdims=True)
+    Phi = np.identity(spikes.height, dtype=np.float64)
+    a = np.empty(spikes.height, dtype=np.float64)
+    for n, agg_states_ in enumerate(agg_states.partition_by("f_index_target")):
+        a.fill(0.0)
+        a[agg_states_["f_index_source"]] = agg_states_["coef"]
+        a /= np.sum(a)
+        Phi[n] = a @ Phi
 
-    return a_to_Phi(a, spikes.height)
+    return Phi
 
 
-def compute_lm_jitters_eigenvalues(spikes, synapses, k=3):
+def compute_lm_jitters_eigenvalues(synapses, spikes, k=3):
     # Spikes is a dataframe with columns: index, period, neuron, time
     # Synapses is a dataframe with columns: source, target, delay, weight
     # States is a dataframe with columns: f_index_source, f_index_target, f_time_in_target (=f_time_out_source + delay), f_time_out_target, weight_0, weight_1 (index, period, f_time_out_source, and delay are optional)
 
     ## Extend spikes with additional information
+
     eigenvalues = {}
-    for (id,), spikes_ in spikes.partition_by("index", as_dict=True).items():
-        Phi = compute_Phi(spikes_, synapses)
-        eigenvalues[id] = ss.linalg.eigs(
+    for (i,), spikes_i in spikes.partition_by("index", as_dict=True).items():
+        Phi = compute_Phi(synapses, spikes_i)
+        eigenvalues[i] = ss.linalg.eigs(
             Phi - 1 / Phi.shape[0], k=k, return_eigenvectors=False
         )
 
     return eigenvalues
 
 
-def compute_jitters_eigenvalues(spikes, synapses):
+def compute_jitters_eigenvalues(synapses, spikes):
     # Spikes is a dataframe with columns: index, period, neuron, time
     # Synapses is a dataframe with columns: source, target, delay, weight
     # States is a dataframe with columns: f_index_source, f_index_target, f_time_in_target (=f_time_out_source + delay), f_time_out_target, weight_0, weight_1 (index, period, f_time_out_source, and delay are optional)
 
-    ## Extend spikes with additional information
     eigenvalues = {}
-    for (id,), spikes_ in spikes.partition_by("index", as_dict=True).items():
-        Phi = compute_Phi(spikes_, synapses)
-        eigenvalues[id] = np.linalg.eigvals(Phi - 1 / Phi.shape[0])
+    for (i,), spikes_i in spikes.partition_by("index", as_dict=True).items():
+        Phi = compute_Phi(synapses, spikes_i)
+        eigenvalues[i] = np.linalg.eigvals(Phi - 1 / Phi.shape[0])
 
     return eigenvalues
 

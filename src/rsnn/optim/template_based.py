@@ -5,45 +5,95 @@ import polars as pl
 from scipy import sparse
 
 import rsnn_plugin as rp
-from rsnn import FIRING_THRESHOLD
+from rsnn import FIRING_THRESHOLD, REFRACTORY_RESET
 from rsnn.log import setup_logging
 from rsnn.optim import GUROBI_STATUS
-from rsnn.optim.utils import compute_linear_map, init_offline_optimization
+from rsnn.optim.utils import (
+    compute_linear_map,
+    init_out_spikes,
+    init_synapses,
+    modulo_with_offset,
+)
 
 logger = setup_logging(__name__, console_level="INFO", file_level="DEBUG")
 
 
-def init_optimization(spikes, synapses, eps):
-    """Returns states with transformed spikes and synapses. Returned states and spikes are sorted by start and time, respectively."""
+def compute_states(synapses, out_spikes, src_spikes, eps):
+    """Returns:
+    - f_states: firing states at spike times with columns f_index, start
+    - syn_states: synaptic transmission states at synaptic event times
+    - rec_states: refractoriness states at refractory event times
+    - states: all states sorted by (f_index, start)
+    """
     if eps < 0:
         raise ValueError("epsilon must be positive.")
 
-    out_spikes, synapses, states = init_offline_optimization(spikes, synapses)
+    # Set the time origins per index
+    origins = out_spikes.group_by("index").agg(pl.min("time_prev").alias("time_origin"))
 
+    # Firing states
     f_states = out_spikes.select(
-        pl.col("neuron"),
+        # pl.col("index"),
         pl.col("f_index"),
         pl.col("time").alias("start"),
-        pl.lit(True, pl.Boolean).alias("active"),
         pl.lit(None, pl.UInt32).alias("in_index"),
         pl.lit(None, pl.Float64).alias("weight"),
         pl.lit(None, pl.Float64).alias("in_coef_0"),
         pl.lit(None, pl.Float64).alias("in_coef_1"),
+        pl.lit(True, pl.Boolean).alias("active"),
     )
 
     before_f_states = out_spikes.select(
-        pl.col("neuron"),
+        # pl.col("index"),
         pl.col("f_index"),
         (pl.col("time") - eps).clip(pl.col("time_prev")).alias("start"),
-        pl.lit(True, pl.Boolean).alias("active"),
         pl.lit(None, pl.UInt32).alias("in_index"),
         pl.lit(None, pl.Float64).alias("weight"),
         pl.lit(None, pl.Float64).alias("in_coef_0"),
         pl.lit(None, pl.Float64).alias("in_coef_1"),
+        pl.lit(True, pl.Boolean).alias("active"),
+    )
+
+    # Refractoriness
+    rec_states = out_spikes.select(
+        pl.col("index"),
+        pl.col("f_index"),
+        pl.col("time_prev").alias("start"),
+        pl.lit(None, pl.UInt32).alias("in_index"),
+        pl.lit(REFRACTORY_RESET, pl.Float64).alias("weight"),
+        pl.lit(1.0, pl.Float64).alias("in_coef_0"),
+        pl.lit(0.0, pl.Float64).alias("in_coef_1"),
+    )
+
+    # Synaptic transmission
+    syn_states = (
+        synapses.join(src_spikes, left_on="source", right_on="neuron")
+        .join(origins, on="index")
+        .select(
+            pl.col("index"),
+            pl.lit(None, pl.UInt32).alias("f_index"),
+            modulo_with_offset(
+                pl.col("time") + pl.col("delay"),
+                pl.col("period"),
+                pl.col("time_origin"),
+            ).alias("start"),
+            pl.col("in_index"),
+            pl.col("weight"),
+            pl.lit(0.0, pl.Float64).alias("in_coef_0"),
+            pl.lit(1.0, pl.Float64).alias("in_coef_1"),
+        )
+    )
+    in_states = syn_states.extend(rec_states).select(
+        pl.col("f_index").forward_fill().over("index", order_by="start"),
+        pl.col("start"),
+        pl.col("in_index"),
+        pl.col("weight"),
+        pl.col("in_coef_0"),
+        pl.col("in_coef_1"),
     )
 
     states = (
-        states.match_to_schema(f_states.schema, missing_columns="insert")
+        in_states.with_columns(pl.lit(None, pl.Boolean).alias("active"))
         .extend(before_f_states)
         .extend(f_states)
         .with_columns(
@@ -61,7 +111,11 @@ def init_optimization(spikes, synapses, eps):
         )
     )
 
-    return out_spikes, synapses, states
+    return (
+        in_states.filter(pl.col("in_index").is_not_null()),
+        in_states.filter(pl.col("in_index").is_null()).drop("in_index"),
+        states,
+    )
 
 
 # def event_offline_optimization(spikes, synapses, wmin, wmax):
@@ -113,9 +167,8 @@ def init_optimization(spikes, synapses, eps):
 
 
 def optimize(
-    spikes,
     synapses,
-    # states,
+    spikes,
     wmin=float("-inf"),
     wmax=float("inf"),
     eps=0.2,
@@ -142,8 +195,13 @@ def optimize(
 
     synapses_lst = []
 
-    for (neuron,), in_synapses in synapses.partition_by("target", as_dict=True).items():
-        out_spikes, in_synapses, states = init_optimization(spikes, in_synapses, eps)
+    for (neuron,), in_synapses in synapses.partition_by(
+        "target", maintain_order=False, as_dict=True
+    ).items():
+        logger.debug(f"Optimizing neuron {neuron}...")
+        # Prepare synapses and output spikes for the current neuron
+        in_synapses = init_synapses(in_synapses, spikes)
+        out_spikes = init_out_spikes(spikes.filter(pl.col("neuron") == neuron))
 
         ## Initialize Gurobi model with variables, objective, and initial constraints (at firing times)
         model = gp.Model("model")
@@ -153,19 +211,27 @@ def optimize(
         weights = model.addMVar(shape=in_synapses.height, lb=wmin, ub=wmax)
         logger.debug(f"Neuron {neuron}. Learnable weights initialized.")
 
-        # Objective function
+        # Objective function - activity-agnostic
         model.setObjective(
             weights @ weights,
             sense=gp.GRB.MINIMIZE,
         )
         logger.debug(f"Neuron {neuron}. Objective function set.")
 
-        # Firing constraints
+        # Compute states for linear constraints
+        syn_states, rec_states, states = compute_states(
+            in_synapses, out_spikes, spikes, eps
+        )
+
+        # Firing time constraints
         syn_lin_map, rec_lin_offset = compute_linear_map(
-            states, out_spikes.select("f_index", "time"), in_synapses
+            syn_states,
+            rec_states,
+            out_spikes.select("f_index", "time"),
+            in_synapses.height,
         )
         model.addConstr(syn_lin_map @ weights + rec_lin_offset == FIRING_THRESHOLD)
-        logger.debug(f"Neuron {neuron}. Firing constraints added.")
+        logger.debug(f"Neuron {neuron}. Firing time constraints added.")
 
         for i in range(n_iter):
             # 1. Optimize weights
@@ -196,9 +262,10 @@ def optimize(
             )
             if silent_violations.height > 0:
                 syn_lin_map, rec_lin_offset = compute_linear_map(
-                    states,
+                    syn_states,
+                    rec_states,
                     silent_violations,
-                    in_synapses,
+                    in_synapses.height,
                 )
                 model.addConstr(
                     syn_lin_map @ weights + rec_lin_offset <= zmax
@@ -220,9 +287,10 @@ def optimize(
             )
             if active_violations.height > 0:
                 syn_lin_map, rec_lin_offset = compute_linear_map(
-                    states,
+                    syn_states,
+                    rec_states,
                     active_violations,
-                    in_synapses,
+                    in_synapses.height,
                     deriv=1,
                 )
                 model.addConstr(

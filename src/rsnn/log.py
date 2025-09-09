@@ -4,10 +4,10 @@ import logging
 def setup_logging(name: str, console_level: str, file_level: str) -> logging.Logger:
     """
     Configure and return a logger with console and file handlers.
-    
+
     Creates a logger with dual output: console (stdout) and file ("app.log").
     Both handlers use the same timestamp format but can have different log levels.
-    
+
     Parameters
     ----------
     name : str
@@ -16,12 +16,12 @@ def setup_logging(name: str, console_level: str, file_level: str) -> logging.Log
         Log level for console output (e.g., "DEBUG", "INFO", "WARNING", "ERROR").
     file_level : str
         Log level for file output (e.g., "DEBUG", "INFO", "WARNING", "ERROR").
-        
+
     Returns
     -------
     logging.Logger
         Configured logger instance with console and file handlers.
-        
+
     Notes
     -----
     The logger is configured with:
@@ -29,7 +29,7 @@ def setup_logging(name: str, console_level: str, file_level: str) -> logging.Log
     - Timestamp format: "YYYY-MM-DD HH:MM:SS.mmm"
     - File output appended to "app.log" in UTF-8 encoding
     - Both handlers use identical formatting
-    
+
     Examples
     --------
     >>> logger = setup_logging(__name__, "INFO", "DEBUG")
