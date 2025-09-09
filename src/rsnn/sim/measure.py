@@ -13,6 +13,34 @@ logger = setup_logging(__name__, console_level="INFO", file_level="INFO")
 def compute_similarities(
     spikes, spikes_ref, shifts, n_neurons, eps=REFRACTORY_PERIOD / 2
 ):
+    """Compute precision and recall similarities between spike trains and (periodic) reference patterns.
+
+    Evaluates how well generated spike trains match reference periodic patterns
+    by computing precision and recall metrics across different temporal shifts.
+    Uses nearest-neighbor matching with tolerance for comparing spike times.
+
+    Args:
+        spikes (pl.DataFrame): Generated spike trains with columns 'neuron', 'time'.
+        spikes_ref (pl.DataFrame): Reference periodic spike patterns with columns
+            'neuron', 'time', 'period'.
+        shifts (pl.DataFrame): Temporal shift values with column 'delta' for
+            alignment testing.
+        n_neurons (int): Total number of neurons in the network.
+        eps (float, optional): Tolerance for spike time matching, half of
+            refractory period by default.
+
+    Returns:
+        tuple[pl.DataFrame, pl.DataFrame]: A tuple containing:
+            - precisions: DataFrame with precision metrics per shift
+            - recalls: DataFrame with recall metrics per shift
+
+    Notes:
+        - Precision measures how many generated spikes match reference spikes
+        - Recall measures how many reference spikes are matched by generated spikes
+        - Silent neurons (no spikes) contribute positively to both metrics
+        - Reference patterns are extended periodically for comparison
+        - Uses temporal tolerance (eps) for nearest-neighbor matching
+    """
     # Adjust spikes
     spikes = spikes.join(
         pl.DataFrame({"neuron": np.arange(n_neurons, dtype=np.uint32)}),

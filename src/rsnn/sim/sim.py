@@ -11,7 +11,24 @@ logger = setup_logging(__name__, console_level="INFO", file_level="DEBUG")
 
 
 def filter_new_spikes(new_spikes, min_delays):
-    """Filter new spikes based on minimum propagation delays. All causally independent spikes are kept."""
+    """Filter new spikes based on minimum propagation delays.
+    
+    Removes spikes that cannot causally affect the network due to propagation
+    delays. Keeps only causally independent spikes that can occur without
+    violating temporal causality constraints.
+    
+    Args:
+        new_spikes (pl.DataFrame): New spike events with columns 'neuron', 'time'.
+        min_delays (pl.DataFrame): Minimum propagation delays with columns
+            'source', 'target', 'delay'.
+    
+    Returns:
+        pl.DataFrame: Filtered spikes that satisfy causal constraints.
+        
+    Notes:
+        All causally independent spikes are kept. A spike is filtered if
+        it would violate causality based on minimum propagation delays.
+    """
     max_times = (
         min_delays.join(new_spikes, left_on="source", right_on="neuron", how="inner")
         .with_columns(
@@ -28,7 +45,23 @@ def filter_new_spikes(new_spikes, min_delays):
 
 
 def filter_spikes(spikes, min_delays):
-    """Filter new spikes based on minimum propagation delays. All causally independent spikes are kept."""
+    """Filter spikes based on minimum propagation delays.
+    
+    Removes spikes that violate causal constraints based on minimum propagation
+    delays between neurons. Ensures temporal consistency in the spike train.
+    
+    Args:
+        spikes (pl.DataFrame): Spike events with columns 'neuron', 'time'.
+        min_delays (pl.DataFrame): Minimum propagation delays with columns
+            'source', 'target', 'delay'.
+    
+    Returns:
+        pl.DataFrame: Filtered spikes satisfying causal temporal constraints.
+        
+    Notes:
+        All causally independent spikes are preserved. Only spikes that would
+        create temporal inconsistencies are filtered out.
+    """
     max_times = (
         min_delays.join(spikes, left_on="source", right_on="neuron", how="inner")
         .with_columns(
@@ -45,6 +78,25 @@ def filter_spikes(spikes, min_delays):
 
 
 def filter_states(states, min_delays, spikes):
+    """Filter neuronal states based on causal propagation constraints.
+    
+    Removes states that start after the maximum causally consistent time
+    for each neuron. Ensures state evolution respects temporal causality
+    based on minimum propagation delays.
+    
+    Args:
+        states (pl.DataFrame): Neuronal states with columns 'neuron', 'start'.
+        min_delays (pl.DataFrame): Minimum propagation delays with columns
+            'source', 'target', 'delay'.
+        spikes (pl.DataFrame): Spike events with columns 'neuron', 'time'.
+    
+    Returns:
+        pl.DataFrame: Filtered states satisfying causal temporal constraints.
+        
+    Notes:
+        States are filtered if their start time exceeds the maximum time
+        at which events can causally affect the target neuron.
+    """
     max_times = (
         min_delays.join(spikes, left_on="source", right_on="neuron", how="inner")
         .with_columns(
@@ -61,7 +113,29 @@ def filter_states(states, min_delays, spikes):
 
 
 def init_states(spikes, synapses):
-    """Warning: spikes must be sorted by time over the neurons"""
+    """Initialize neuronal states from spikes and synaptic connections.
+    
+    Creates initial state representation for the simulation by computing
+    synaptic and refractory states from existing spikes. Filters out
+    states that start before the last spike of each neuron.
+    
+    Args:
+        spikes (pl.DataFrame): Spike events with columns 'neuron', 'time'.
+            Must be sorted by time over neurons.
+        synapses (pl.DataFrame): Synaptic connections with columns 'source',
+            'target', 'delay', 'weight'.
+    
+    Returns:
+        pl.DataFrame: Initial states with columns 'neuron', 'start', 
+            'in_coef_0', 'in_coef_1'.
+    
+    Warning:
+        Spikes must be sorted by time over the neurons for correct operation.
+        
+    Notes:
+        Combines synaptic states (from incoming connections) and refractory
+        states (from last spikes) to create the initial condition for simulation.
+    """
     # Compute last spikes per neuron
     last_spikes = spikes.group_by("neuron").agg(pl.last("time"))
 
@@ -90,8 +164,26 @@ def init_states(spikes, synapses):
 
 
 def init_min_delays(synapses, n_neurons):
-    """Compute the fastest synapses between nodes in a directed graph."""
-
+    """Compute shortest path delays between all pairs of neurons.
+    
+    Calculates the minimum propagation delays between all neuron pairs
+    using the Floyd-Warshall algorithm on the synaptic connectivity graph.
+    Used for enforcing causal constraints during simulation.
+    
+    Args:
+        synapses (pl.DataFrame): Synaptic connections with columns 'source',
+            'target', 'delay'.
+        n_neurons (int): Total number of neurons in the network.
+    
+    Returns:
+        pl.DataFrame: Minimum delays between all connected neuron pairs
+            with columns 'source', 'target', 'delay'.
+            
+    Notes:
+        Uses sparse matrix representation and Floyd-Warshall algorithm for
+        efficient all-pairs shortest path computation. Only finite delays
+        (reachable pairs) are returned in the result.
+    """
     # Initialize fast synapses by grouping and aggregating the minimum delay
     min_delays = synapses.group_by(["source", "target"]).agg(
         pl.min("delay").alias("delay")
@@ -118,14 +210,36 @@ def init_min_delays(synapses, n_neurons):
 
 
 def run(neurons, spikes, synapses, start, end, std_threshold=0.0, rng=None):
-    """
-    Run the simulation from tmin to tmax.
-
-    neurons has columns: neuron, f_thresh
-    spikes has columns: neuron, time
-    synapses has columns: source, target, delay, weight
-
-    states has columns: neuron, start, in_coef_0, in_coef_1
+    """Run discrete event simulation of spiking neural network.
+    
+    Executes a discrete event simulation of the spiking neural network from
+    start to end time. Uses event-driven simulation with causal filtering
+    to maintain temporal consistency and efficiency.
+    
+    Args:
+        neurons (pl.DataFrame): Neuron properties with columns 'neuron', 'f_thresh'.
+        spikes (pl.DataFrame): Initial spike events with columns 'neuron', 'time'.
+        synapses (pl.DataFrame): Synaptic connections with columns 'source',
+            'target', 'delay', 'weight'.
+        start (float): Simulation start time.
+        end (float): Simulation end time.
+        std_threshold (float, optional): Standard deviation for threshold
+            noise. Defaults to 0.0.
+        rng (np.random.Generator, optional): Random number generator for
+            threshold noise. Defaults to None.
+    
+    Returns:
+        tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]: A tuple containing:
+            - neurons: Updated neuron states with final thresholds
+            - spikes: Complete spike train including generated spikes  
+            - states: Final neuronal states at simulation end
+    
+    Notes:
+        Uses discrete event simulation with:
+        - Causal filtering based on minimum propagation delays
+        - Dynamic threshold updates with optional noise
+        - Event-driven state updates for efficiency
+        - Refractory and synaptic state management
     """
     if rng is None:
         rng = np.random.default_rng()

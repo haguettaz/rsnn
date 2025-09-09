@@ -11,6 +11,29 @@ logger = setup_logging(__name__, console_level="DEBUG", file_level="INFO")
 
 
 def compute_Phi(synapses, spikes):
+    """Compute the spike propagation matrix Phi for jitter analysis.
+
+    Calculates the linear transformation matrix that describes how spike
+    perturbations propagate through the network. The matrix incorporates
+    both synaptic transmission and refractory effects.
+
+    Args:
+        synapses (pl.DataFrame): Synaptic connections with columns 'source',
+            'target', 'delay', 'weight'.
+        spikes (pl.DataFrame): Spike train data with columns 'neuron', 'time',
+            'period'.
+
+    Returns:
+        np.ndarray: Spike propagation matrix Phi with shape (n_spikes, n_spikes).
+            Each row represents how perturbations of all spikes affect one
+            specific spike time.
+
+    Notes:
+        The matrix computation involves:
+        - Refractory contributions from previous spikes of the same neuron
+        - Synaptic contributions from connected neurons with appropriate delays
+        - Exponential decay factors for temporal dynamics
+    """
     # Init spikes with f_index and time_prev
     spikes = spikes.sort("time").with_columns(
         pl.int_range(pl.len(), dtype=pl.UInt32).alias("f_index"),
@@ -102,6 +125,27 @@ def compute_Phi(synapses, spikes):
 
 
 def compute_lm_jitters_eigenvalues(synapses, spikes, k=3):
+    """Compute dominant eigenvalues of the jitter propagation matrices using sparse methods.
+
+    Calculates the k largest eigenvalues of the deflated spike propagation matrix for each spike pattern index.
+    Uses sparse eigenvalue computation for efficiency when only a few dominant eigenvalues are needed.
+
+    Args:
+        synapses (pl.DataFrame): Synaptic connections with columns 'source',
+            'target', 'delay', 'weight'.
+        spikes (pl.DataFrame): Spike train data with columns 'index', 'neuron',
+            'time', 'period'.
+        k (int, optional): Number of dominant eigenvalues to compute. Defaults to 3.
+
+    Returns:
+        dict: Dictionary mapping spike pattern indices to their k dominant
+            eigenvalues as numpy arrays.
+
+    Notes:
+        Uses scipy.sparse.linalg.eigs for efficient computation of dominant
+        eigenvalues without computing the full eigenspectrum. The deflated
+        matrix (Phi - 1/n) removes the trivial eigenvalue at 1 corresponding to a global drift.
+    """
     # Spikes is a dataframe with columns: index, period, neuron, time
     # Synapses is a dataframe with columns: source, target, delay, weight
     # States is a dataframe with columns: f_index_source, f_index_target, f_time_in_target (=f_time_out_source + delay), f_time_out_target, weight_0, weight_1 (index, period, f_time_out_source, and delay are optional)
@@ -119,6 +163,27 @@ def compute_lm_jitters_eigenvalues(synapses, spikes, k=3):
 
 
 def compute_jitters_eigenvalues(synapses, spikes):
+    """Compute all eigenvalues of the jitter propagation matrix.
+
+    Calculates the complete eigenspectrum of the deflated spike propagation matrix for each spike pattern index.
+    Computes all eigenvalues using dense linear algebra methods.
+
+    Args:
+        synapses (pl.DataFrame): Synaptic connections with columns 'source',
+            'target', 'delay', 'weight'.
+        spikes (pl.DataFrame): Spike train data with columns 'index', 'neuron',
+            'time', 'period'.
+
+    Returns:
+        dict: Dictionary mapping spike pattern indices to their complete
+            eigenvalue arrays as numpy arrays.
+
+    Notes:
+        Uses numpy.linalg.eigvals for full eigenvalue computation. More
+        computationally expensive than compute_lm_jitters_eigenvalues but
+        provides the complete eigenspectrum. The deflated matrix (Phi - 1/n)
+        removes the trivial eigenvalue at 1 corresponding to a global drift.
+    """
     # Spikes is a dataframe with columns: index, period, neuron, time
     # Synapses is a dataframe with columns: source, target, delay, weight
     # States is a dataframe with columns: f_index_source, f_index_target, f_time_in_target (=f_time_out_source + delay), f_time_out_target, weight_0, weight_1 (index, period, f_time_out_source, and delay are optional)

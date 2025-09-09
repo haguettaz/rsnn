@@ -13,16 +13,23 @@ def pmf_n_f_times(
 ) -> Tuple[npt.NDArray[np.intp], npt.NDArray[np.float64]]:
     """Compute probability mass function for number of spikes in a periodic spike train.
 
-    For numerical stability, the PMF is computed in the log domain first.
+    Calculates the PMF for the number of spikes that can fit within a period
+    while respecting refractory period constraints. Uses log-domain computation
+    for numerical stability.
 
     Args:
-        period: Period of the spike train in time units.
-        rate: Firing rate of the spike train in 1/time units.
+        period (float): Period of the spike train in time units.
+        rate (float): Firing rate of the spike train in spikes per time unit.
 
     Returns:
-        Tuple containing:
-            - Support values (number of spikes)
-            - Corresponding probabilities
+        Tuple[npt.NDArray[np.intp], npt.NDArray[np.float64]]: A tuple containing:
+            - Support values (possible number of spikes)
+            - Corresponding probabilities for each spike count
+
+    Notes:
+        For numerical stability, the PMF is computed in the log domain first
+        and then normalized. The computation accounts for the combinatorial
+        constraints imposed by the refractory period.
     """
     ns = np.arange(period, dtype=int)
     logpns = (ns - 1) * np.log(period - ns) + ns * np.log(rate)
@@ -35,12 +42,20 @@ def pmf_n_f_times(
 def expected_n_f_times(period: float, rate: float) -> float:
     """Compute expected number of spikes in a periodic spike train.
 
+    Calculates the expected number of spikes that can occur within one period
+    of a periodic spike train, taking into account the firing rate and
+    refractory period constraints.
+
     Args:
-        period: Period of the spike train in time units.
-        rate: Firing rate of the spike train in 1/time units.
+        period (float): Period of the spike train in time units.
+        rate (float): Firing rate of the spike train in spikes per time unit.
 
     Returns:
-        Expected number of spikes in one period.
+        float: Expected number of spikes in one period.
+
+    Notes:
+        Uses the probability mass function from pmf_n_f_times to compute
+        the weighted average of possible spike counts.
     """
     ns, pns = pmf_n_f_times(period, rate)
     return np.inner(ns, pns)
@@ -55,19 +70,26 @@ def rand_spikes(
     """Generate random multi-channel periodic spike trains.
 
     Creates random spike trains for multiple neurons following a Poisson process
-    within each period, ensuring proper refractory period constraints.
+    within each period, ensuring proper refractory period constraints. Each neuron
+    generates spikes independently according to the specified rates and periods.
 
     Args:
-        n_neurons: Number of neurons/channels.
-        period: Period duration of the spike train.
-        rate: Average firing rate per neuron.
-        rng: Random number generator. If None, uses default_rng().
+        n_neurons (int): Number of neurons/channels to simulate.
+        periods (list[float]): List of period durations for each spike train pattern.
+        rates (list[float]): List of average firing rates per neuron (spikes per time unit).
+        rng (Optional[np.random.Generator], optional): Random number generator.
+            If None, uses numpy's default_rng(). Defaults to None.
 
     Returns:
-        DataFrame with columns: neuron, time, period.
+        pl.DataFrame: Spike train data with columns 'index', 'neuron', 'time', 'period'.
 
     Raises:
-        ValueError: If period or rate is negative.
+        ValueError: If any period or rate is negative.
+
+    Notes:
+        Uses an effective Poisson process to generate spikes while respecting
+        the refractory period constraint. Spikes are distributed uniformly
+        within each period after accounting for refractory spacing.
     """
     if any(period < 0.0 for period in periods):
         raise ValueError(f"All periods should be non-negative.")
@@ -81,9 +103,9 @@ def rand_spikes(
     spikes = pl.DataFrame(
         schema={
             "index": pl.UInt32,
+            "period": pl.Float64,
             "neuron": pl.UInt32,
             "time": pl.Float64,
-            "period": pl.Float64,
         }
     )
 
@@ -107,15 +129,15 @@ def rand_spikes(
                     pl.DataFrame(
                         {
                             "index": i,
+                            "period": period,
                             "neuron": l,
                             "time": new_f_times % period,
-                            "period": period,
                         },
                         schema={
                             "index": pl.UInt32,
+                            "period": pl.Float64,
                             "neuron": pl.UInt32,
                             "time": pl.Float64,
-                            "period": pl.Float64,
                         },
                     )
                 )
@@ -134,22 +156,32 @@ def rand_jit_f_times(
     """Generate jittered version of spike train using Gibbs sampling.
 
     Applies Gaussian jitter to firing times while respecting refractory period
-    constraints. Uses alternating sampling of even/odd indices to maintain
-    temporal ordering.
+    constraints and temporal ordering. Uses alternating Gibbs sampling of
+    even/odd indexed spikes to maintain feasibility.
 
     Args:
-        f_times: Original firing times to be jittered.
-        std_jitter: Standard deviation of Gaussian jitter noise.
-        start: Lower bound of allowed time range.
-        end: Upper bound of allowed time range.
-        n_iter: Maximum number of Gibbs sampling iterations.
-        rng: Random number generator. If None, uses default_rng().
+        f_times (npt.NDArray[np.float64]): Original firing times to be jittered.
+        std_jitter (float): Standard deviation of Gaussian jitter noise.
+        start (float, optional): Lower bound of allowed time range.
+            Defaults to -inf.
+        end (float, optional): Upper bound of allowed time range.
+            Defaults to inf.
+        n_iter (int, optional): Maximum number of Gibbs sampling iterations.
+            Defaults to 1000.
+        rng (Optional[np.random.Generator], optional): Random number generator.
+            If None, uses default_rng(). Defaults to None.
 
     Returns:
-        Jittered firing times maintaining refractory constraints.
+        npt.NDArray[np.float64]: Jittered firing times maintaining refractory
+            constraints and temporal ordering.
 
     Raises:
-        ValueError: If firing times are outside [start, end] range.
+        ValueError: If firing times are outside the [start, end] range.
+
+    Notes:
+        Uses truncated normal sampling with alternating updates of even/odd
+        indices to maintain the refractory period constraint between consecutive
+        spikes while allowing controlled jitter around original times.
     """
     if f_times.min(initial=np.inf) < start or f_times.max(initial=-np.inf) > end:
         raise ValueError(
