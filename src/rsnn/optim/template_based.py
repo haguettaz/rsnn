@@ -175,7 +175,7 @@ def optimize(
         2. Adding new constraints for detected violations in silent/active regions
         Converges when no more constraint violations are found.
     """
-    if eps < 0:
+    if eps <= 0:
         raise ValueError("epsilon must be positive.")
 
     if zmax > FIRING_THRESHOLD:
