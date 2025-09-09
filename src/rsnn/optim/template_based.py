@@ -39,7 +39,7 @@ def compute_states(
             - states: All states with columns 'f_index', 'start', 'in_index', 'weight', 'in_coef_0', 'in_coef_1', 'active', 'length', and sorted by start time over each firing index group.
 
     Raises:
-        ValueError: If eps is negative.
+        ValueError: If eps is not positive.
     """
     if eps <= 0:
         raise ValueError("epsilon must be positive.")
