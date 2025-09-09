@@ -6,8 +6,6 @@ __pycache__/
 # Visual Studio files
 .vscode/
 
-# Notebook data
-notebooks/data/
 
 # Archive files
 archive/
@@ -21,6 +19,7 @@ build/
 develop-eggs/
 dist/
 downloads/
+private/
 eggs/
 .eggs/
 lib/
@@ -139,5 +138,7 @@ dmypy.json
 
 # MAC OS
 .DS_Store
+
+/private
 
 /private
