@@ -122,7 +122,7 @@ def init_states(spikes: pl.DataFrame, synapses: pl.DataFrame) -> pl.DataFrame:
     Creates initial state representation for the simulation by computing synaptic and refractory states from existing spikes. Filters out states that start before the last spike of each neuron.
 
     Args:
-        spikes (pl.DataFrame): Spike events with columns 'neuron', 'time'. Must be sorted by time (at least over neurons).
+        spikes (pl.DataFrame): Spike events with columns 'neuron', 'time'. Must be sorted by time within each neuron group.
         synapses (pl.DataFrame): Synaptic connections with columns 'source', 'target', 'delay', 'weight'.
 
     Returns:

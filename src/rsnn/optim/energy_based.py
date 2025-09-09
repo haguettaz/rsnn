@@ -270,9 +270,10 @@ def optimize(
 
         model.optimize()
         if model.status != gp.GRB.OPTIMAL:
-            raise RuntimeError(
+            logger.error(
                 f"Neuron {neuron}. Optimization failed: {GUROBI_STATUS[model.status]}"
             )
+            return synapses.with_columns(pl.lit(None, pl.Float64).alias("weight"))
 
         logger.info(f"Neuron {neuron}. Optimization completed!")
         synapses_lst.append(

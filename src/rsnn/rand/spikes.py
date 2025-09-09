@@ -97,15 +97,7 @@ def rand_spikes(
     if rng is None:
         rng = np.random.default_rng()
 
-    spikes = pl.DataFrame(
-        schema={
-            "index": pl.UInt32,
-            "period": pl.Float64,
-            "neuron": pl.UInt32,
-            "time": pl.Float64,
-        }
-    )
-
+    spikes_lst = []
     for i, (period, rate) in enumerate(zip(periods, rates)):
         if period <= REFRACTORY_PERIOD or rate == 0.0:
             continue
@@ -122,24 +114,29 @@ def rand_spikes(
                     rng.uniform(0, period - n, n - 1)
                 ) + np.arange(1, n)
 
-                spikes = spikes.vstack(
+                spikes_lst.append(
                     pl.DataFrame(
-                        {
-                            "index": i,
-                            "period": period,
-                            "neuron": l,
-                            "time": new_f_times % period,
-                        },
-                        schema={
-                            "index": pl.UInt32,
-                            "period": pl.Float64,
-                            "neuron": pl.UInt32,
-                            "time": pl.Float64,
-                        },
+                        [
+                            pl.Series("index", [i] * n, dtype=pl.UInt32),
+                            pl.Series("period", [period] * n, dtype=pl.Float64),
+                            pl.Series("neuron", [l] * n, dtype=pl.UInt32),
+                            pl.Series(
+                                "time", np.sort(new_f_times % period), dtype=pl.Float64
+                            ),
+                        ],
                     )
                 )
 
-    return spikes.sort(["index", "time"])
+    if spikes_lst:
+        return pl.concat(spikes_lst)
+    return pl.DataFrame(
+        schema={
+            "index": pl.UInt32,
+            "period": pl.Float64,
+            "neuron": pl.UInt32,
+            "time": pl.Float64,
+        }
+    )
 
 
 def rand_jit_f_times(

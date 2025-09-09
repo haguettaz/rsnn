@@ -113,7 +113,12 @@ def compute_Phi(synapses: pl.DataFrame, spikes: pl.DataFrame) -> np.ndarray:
     for n, agg_states_ in enumerate(agg_states.partition_by("f_index_target")):
         a.fill(0.0)
         a[agg_states_["f_index_source"]] = agg_states_["coef"]
-        a /= np.sum(a)
+        s = np.sum(a)
+        if s == 0.0:
+            raise ValueError(
+                f"Undefined jitter propagation matrix: the potential derivative at spike index {n} is zero."
+            )
+        a /= s
         Phi[n] = a @ Phi
 
     return Phi

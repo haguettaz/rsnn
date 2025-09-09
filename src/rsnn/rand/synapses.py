@@ -8,7 +8,7 @@ def new_synapses(
     sources: np.ndarray,
     targets: np.ndarray,
     delays: np.ndarray | float = 0.0,
-    weight: np.ndarray | float = 0.0,
+    weights: np.ndarray | float = 0.0,
 ):
     """Create a new synapses DataFrame with specified connections.
 
@@ -21,7 +21,7 @@ def new_synapses(
         targets (np.ndarray): Array of target neuron indices.
         delays (np.ndarray | float, optional): Synaptic delays.
             Can be array or scalar. Defaults to 0.0.
-        weight (np.ndarray | float, optional): Synaptic weights.
+        weights (np.ndarray | float, optional): Synaptic weights.
             Can be array or scalar. Defaults to 0.0.
 
     Returns:
@@ -31,23 +31,27 @@ def new_synapses(
         - Synapses are first-order connections implementing alpha kernels.
         - All arrays must have compatible lengths for broadcasting.
     """
+    if sources.shape != targets.shape:
+        raise ValueError("sources and targets must have the same shape")
+
+    n_synapses = sources.size
+    if isinstance(delays, float):
+        delays = np.full(n_synapses, delays, dtype=np.float64)
+    elif delays.shape != sources.shape:  # type: ignore
+        raise ValueError("delays must be a float or have the same shape as sources")
+
+    if isinstance(weights, float):
+        weights = np.full(n_synapses, weights, dtype=np.float64)
+    elif weights.shape != sources.shape:  # type: ignore
+        raise ValueError("weights must be a float or have the same shape as sources")
+
     return pl.DataFrame(
-        data={
-            "source": sources,
-            "target": targets,
-            "delay": delays,
-            "weight": weight,
-            # "in_coef_0": in_coef_0,
-            # "in_coef_1": in_coef_1,
-        },
-        schema={
-            "source": pl.UInt32,
-            "target": pl.UInt32,
-            "delay": pl.Float64,
-            "weight": pl.Float64,
-            # "in_coef_0": pl.Float64,
-            # "in_coef_1": pl.Float64,
-        },
+        [
+            pl.Series("source", sources, dtype=pl.UInt32),
+            pl.Series("target", targets, dtype=pl.UInt32),
+            pl.Series("delay", delays, dtype=pl.Float64),
+            pl.Series("weight", weights, dtype=pl.Float64),
+        ]
     )
 
 

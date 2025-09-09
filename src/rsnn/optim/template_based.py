@@ -100,8 +100,8 @@ def compute_states(
         )
     )
     in_states = (
-        syn_states.sort("start")
-        .merge_sorted(rec_states, key="start")
+        syn_states.extend(rec_states)
+        .sort("start")
         .select(
             pl.col("f_index").forward_fill().over("index"),
             pl.col("start"),
@@ -114,8 +114,9 @@ def compute_states(
 
     states = (
         in_states.with_columns(pl.lit(None, pl.Boolean).alias("active"))
-        .merge_sorted(before_f_states, key="start")
-        .merge_sorted(f_states, key="start")
+        .extend(before_f_states)
+        .extend(f_states)
+        .sort("start")
         .with_columns(
             pl.col("active").forward_fill().fill_null(False).over("f_index"),
             pl.col("start")
