@@ -263,7 +263,7 @@ def rand_synapses_fout(
 
     return new_synapses(
         sources=np.arange(n_synapses) % n_neurons,
-        targets=rng.integers(0, n_neurons, size=n_synapses, dtype=np.intp),
+        targets=rng.integers(0, n_neurons, size=n_synapses, dtype=np.uint32),
         delays=rng.uniform(min_delay, max_delay, size=n_synapses),
     )
 
