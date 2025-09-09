@@ -207,7 +207,7 @@ def rand_synapses_fin(
         rng = np.random.default_rng()
 
     return new_synapses(
-        sources=rng.integers(0, n_neurons, size=n_synapses, dtype=np.intp),
+        sources=rng.integers(0, n_neurons, size=n_synapses, dtype=np.uint32),
         targets=np.arange(n_synapses) % n_neurons,
         delays=rng.uniform(min_delay, max_delay, size=n_synapses),
     )
