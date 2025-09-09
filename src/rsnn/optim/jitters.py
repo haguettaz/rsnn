@@ -10,7 +10,7 @@ from rsnn.optim.utils import modulo_with_offset
 logger = setup_logging(__name__, console_level="DEBUG", file_level="INFO")
 
 
-def compute_Phi(synapses, spikes):
+def compute_Phi(synapses: pl.DataFrame, spikes: pl.DataFrame) -> np.ndarray:
     """Compute the spike propagation matrix Phi for jitter analysis.
 
     Calculates the linear transformation matrix that describes how spike
@@ -18,15 +18,10 @@ def compute_Phi(synapses, spikes):
     both synaptic transmission and refractory effects.
 
     Args:
-        synapses (pl.DataFrame): Synaptic connections with columns 'source',
-            'target', 'delay', 'weight'.
-        spikes (pl.DataFrame): Spike train data with columns 'neuron', 'time',
-            'period'.
-
+        synapses (pl.DataFrame): Synaptic connections with columns 'source', 'target', 'delay', 'weight'.
+        spikes (pl.DataFrame): Spike train data with columns 'period', 'neuron', 'time'.
     Returns:
-        np.ndarray: Spike propagation matrix Phi with shape (n_spikes, n_spikes).
-            Each row represents how perturbations of all spikes affect one
-            specific spike time.
+        np.ndarray: Spike propagation matrix Phi with shape (n_spikes, n_spikes). Each row represents how perturbations of all spikes affect one specific spike time.
 
     Notes:
         The matrix computation involves:

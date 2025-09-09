@@ -1,8 +1,6 @@
-from collections import defaultdict
-
 import gurobipy as gp
+import numpy as np
 import polars as pl
-from scipy import sparse
 
 import rsnn_plugin as rp
 from rsnn import FIRING_THRESHOLD, REFRACTORY_RESET
@@ -18,40 +16,38 @@ from rsnn.optim.utils import (
 logger = setup_logging(__name__, console_level="INFO", file_level="DEBUG")
 
 
-def compute_states(synapses, out_spikes, src_spikes, eps):
+def compute_states(
+    synapses: pl.DataFrame,
+    out_spikes: pl.DataFrame,
+    src_spikes: pl.DataFrame,
+    eps: float,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """Compute neuronal states for template-based optimization.
 
-    Calculates different types of states needed for the template-based optimization:
-    firing states, synaptic transmission states, and refractory states. Also computes
-    before-firing states for constraint violations.
+    Calculates different types of states needed for the template-based optimization: firing states, synaptic transmission states, and refractory states. Also computes before-firing states for constraint violations.
 
     Args:
-        synapses (pl.DataFrame): Synaptic connections with columns 'source', 'target', 'delay', 'weight'.
-        out_spikes (pl.DataFrame): Output spike times with columns 'index', 'period', 'f_index', 'time', 'time_prev'.
+        synapses (pl.DataFrame): Synaptic connections with columns including 'source', 'target', 'delay'.
+        out_spikes (pl.DataFrame): Output spike times with columns 'index', 'period', 'neuron', 'f_index', 'time', 'time_prev'. Must be sorted by time within each (index, neuron) group.
         src_spikes (pl.DataFrame): Source spike times with columns 'index', 'period', 'neuron', 'time'.
         eps (float): Epsilon parameter for before-firing state timing.
 
     Returns:
         tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]: A tuple containing:
-            - syn_states: Synaptic transmission states with in_index
-            - rec_states: Refractory states without in_index
-            - states: All states sorted by (f_index, start) with active flags
+            - syn_states: Synaptic transmission states with columns 'f_index', 'in_index', 'start'
+            - rec_states: Refractory states with columns 'f_index', 'start'
+            - states: All states with columns 'f_index', 'start', 'in_index', 'weight', 'in_coef_0', 'in_coef_1', 'active', 'length', and sorted by start time over each firing index group.
 
     Raises:
         ValueError: If eps is negative.
-
-    Notes:
-        The function computes:
-        - Firing states at exact spike times
-        - Before-firing states at time - eps to define active and silent regions
-        - Refractory states from previous spikes
-        - Synaptic states from incoming connections
     """
     if eps <= 0:
         raise ValueError("epsilon must be positive.")
 
     # Set the time origins per index
-    origins = out_spikes.group_by("index").agg(pl.min("time_prev").alias("time_origin"))
+    origins = out_spikes.group_by(["index", "neuron"]).agg(
+        pl.first("time_prev").alias("time_origin")
+    )
 
     # Firing states
     f_states = out_spikes.select(
@@ -87,8 +83,8 @@ def compute_states(synapses, out_spikes, src_spikes, eps):
 
     # Synaptic transmission
     syn_states = (
-        synapses.join(src_spikes, left_on="source", right_on="neuron")
-        .join(origins, on="index")
+        origins.join(synapses, left_on="neuron", right_on="target")
+        .join(src_spikes, left_on=["index", "source"], right_on=["index", "neuron"])
         .select(
             pl.col("index"),
             pl.lit(None, pl.UInt32).alias("f_index"),
@@ -98,57 +94,58 @@ def compute_states(synapses, out_spikes, src_spikes, eps):
                 pl.col("time_origin"),
             ).alias("start"),
             pl.col("in_index"),
-            pl.col("weight"),
+            pl.lit(None, pl.Float64).alias("weight"),
             pl.lit(0.0, pl.Float64).alias("in_coef_0"),
             pl.lit(1.0, pl.Float64).alias("in_coef_1"),
         )
     )
-    in_states = syn_states.extend(rec_states).select(
-        pl.col("f_index").forward_fill().over("index", order_by="start"),
-        pl.col("start"),
-        pl.col("in_index"),
-        pl.col("weight"),
-        pl.col("in_coef_0"),
-        pl.col("in_coef_1"),
+    in_states = (
+        syn_states.sort("start")
+        .merge_sorted(rec_states, key="start")
+        .select(
+            pl.col("f_index").forward_fill().over("index"),
+            pl.col("start"),
+            pl.col("in_index"),
+            pl.col("weight"),
+            pl.col("in_coef_0"),
+            pl.col("in_coef_1"),
+        )
     )
 
     states = (
         in_states.with_columns(pl.lit(None, pl.Boolean).alias("active"))
-        .extend(before_f_states)
-        .extend(f_states)
+        .merge_sorted(before_f_states, key="start")
+        .merge_sorted(f_states, key="start")
         .with_columns(
-            pl.col("active")
-            .forward_fill()
-            .fill_null(False)
-            .over("f_index", order_by="start")
-        )
-        .with_columns(
+            pl.col("active").forward_fill().fill_null(False).over("f_index"),
             pl.col("start")
             .diff()
             .shift(-1, fill_value=0.0)
-            .over("f_index", order_by="start")
-            .alias("length")
+            .over("f_index")
+            .alias("length"),
         )
     )
 
     return (
-        in_states.filter(pl.col("in_index").is_not_null()),
-        in_states.filter(pl.col("in_index").is_null()).drop("in_index"),
+        in_states.filter(pl.col("in_index").is_not_null()).select(
+            "f_index", "start", "in_index"
+        ),
+        in_states.filter(pl.col("in_index").is_null()).select("f_index", "start"),
         states,
     )
 
 
 def optimize(
-    synapses,
-    spikes,
-    wmin=float("-inf"),
-    wmax=float("inf"),
-    eps=0.2,
-    zmax=0.0,
-    dzmin=1.0,
-    n_iter=1000,
-    feas_tol=1e-5,
-):
+    synapses: pl.DataFrame,
+    spikes: pl.DataFrame,
+    wmin: float = float("-inf"),
+    wmax: float = float("inf"),
+    eps: float = 0.2,
+    zmax: float = 0.0,
+    dzmin: float = 2.0,
+    n_iter: int = 1000,
+    feas_tol: float = 1e-5,
+) -> pl.DataFrame:
     """Optimize synaptic weights using template-based iterative constraint refinement.
 
     Performs iterative optimization of synaptic weights by alternating between weight optimization and constraint refinement.
@@ -156,7 +153,7 @@ def optimize(
 
     Args:
         synapses (pl.DataFrame): Synaptic connections with columns 'source', 'target', 'delay', 'weight'.
-        spikes (pl.DataFrame): Spike train data with columns 'index', 'period', 'neuron', 'time', 'time_prev'.
+        spikes (pl.DataFrame): Spike train data with columns 'index', 'period', 'neuron', 'time'.
         wmin (float, optional): Minimum synaptic weight bound. Defaults to -inf.
         wmax (float, optional): Maximum synaptic weight bound. Defaults to inf.
         eps (float, optional): Epsilon parameter for before-firing constraints. Defaults to 0.2.
@@ -240,7 +237,7 @@ def optimize(
                 )
                 return synapses.with_columns(pl.lit(None, pl.Float64).alias("weight"))
 
-            states = scan_with_new_weights(states, weights.X)
+            states = scan_with_new_weights(states, weights.X)  # type: ignore
 
             # 2. Refine constraints
             silent_violations = (
@@ -264,9 +261,7 @@ def optimize(
                     rec_states,
                     silent_violations,
                 )
-                model.addConstr(
-                    syn_lin_map @ weights + rec_lin_offset <= zmax
-                )  # silent area: z <= zmax
+                model.addConstr(syn_lin_map @ weights + rec_lin_offset <= zmax)  # type: ignore
 
             active_violations = (
                 states.filter(pl.col("active") == True)
@@ -290,9 +285,7 @@ def optimize(
                     active_violations,
                     deriv=1,
                 )
-                model.addConstr(
-                    syn_lin_map @ weights + rec_lin_offset >= dzmin
-                )  # active area: dz >= dzmin
+                model.addConstr(syn_lin_map @ weights + rec_lin_offset >= dzmin)  # type: ignore
 
             n_violations = active_violations.height + silent_violations.height
 
@@ -315,28 +308,21 @@ def optimize(
     return pl.concat(synapses_lst)
 
 
-def scan_with_new_weights(states, weights):
+def scan_with_new_weights(states: pl.DataFrame, weights: np.ndarray) -> pl.DataFrame:
     """Update state coefficients with new synaptic weights using cumulative scanning.
 
-    Recalculates the membrane potential coefficients (coef_0, coef_1) for all states
-    after updating synaptic weights. Uses temporal scanning to accumulate the effects
-    of synaptic inputs over time with exponential decay.
+    Recalculates the membrane potential coefficients (coef_0, coef_1) for all states after updating synaptic weights. Uses temporal scanning to accumulate the effects of synaptic inputs over time with exponential decay.
 
     Args:
-        states (pl.DataFrame): Neuronal states with columns 'f_index', 'start',
-            'length', 'in_index', 'in_coef_0', 'in_coef_1', 'weight'.
+        states (pl.DataFrame): Neuronal states with columns 'f_index', 'start', 'length', 'in_index', 'in_coef_0', 'in_coef_1', 'weight'. Must be sorted by start time within each f_index group
         weights (np.ndarray): New synaptic weight values to apply.
 
     Returns:
-        pl.DataFrame: Updated states with recalculated 'coef_0' and 'coef_1' columns.
+        pl.DataFrame: Updated states with recalculated 'weight', 'coef_0', and 'coef_1' columns.
 
     Notes:
-        - States must be sorted by start time within each f_index group
         - Uses exponential decay scanning for temporal dynamics
         - Updates both constant (coef_0) and linear (coef_1) membrane potential terms
-
-    Warning:
-        States must be sorted by start in the grouping provided by over.
     """
     return (
         states.update(
@@ -347,7 +333,7 @@ def scan_with_new_weights(states, weights):
             rp.scan_coef_1(
                 pl.col("length").shift(), pl.col("in_coef_1") * pl.col("weight")
             )
-            .over("f_index", order_by="start")
+            .over("f_index")
             .alias("coef_1")
         )
         .with_columns(
@@ -356,7 +342,7 @@ def scan_with_new_weights(states, weights):
                 pl.col("coef_1").shift(),
                 pl.col("in_coef_0") * pl.col("weight"),
             )
-            .over("f_index", order_by="start")
+            .over("f_index")
             .alias("coef_0")
         )
     )

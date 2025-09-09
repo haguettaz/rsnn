@@ -11,15 +11,13 @@ from rsnn.log import setup_logging
 logger = setup_logging(__name__, console_level="DEBUG", file_level="DEBUG")
 
 
-def init_synapses(synapses, spikes):
+def init_synapses(synapses: pl.DataFrame, spikes: pl.DataFrame) -> pl.DataFrame:
     """Initialize and filter synapses to include only active connections.
 
-    Prunes synapses to keep only those that have a source neuron that spikes
-    at least once, then adds a unique in_index to each remaining synapse for
-    optimization purposes.
+    Prunes synapses to keep only those that have a source neuron that spikes at least once, then adds a unique in_index to each remaining synapse for optimization purposes.
 
     Args:
-        synapses (pl.DataFrame): Synaptic connections with columns including 'source', 'target', 'delay', 'weight'.
+        synapses (pl.DataFrame): Synaptic connections with columns including 'source'.
         spikes (pl.DataFrame): Spike train data with columns including 'neuron'.
 
     Returns:
@@ -35,11 +33,10 @@ def init_synapses(synapses, spikes):
     ).with_columns(pl.int_range(pl.len(), dtype=pl.UInt32).alias("in_index"))
 
 
-def init_out_spikes(spikes):
+def init_out_spikes(spikes: pl.DataFrame) -> pl.DataFrame:
     """Initialize output spikes with indices and temporal information.
 
-    Processes (periodic) spike data to add firing indices (f_index) and previous spike times
-    (time_prev) needed for neuronal state computations.
+    Processes (periodic) spike data to add firing indices (f_index) and previous spike times (time_prev) needed for neuronal state computations.
 
     Args:
         spikes (pl.DataFrame): Spike data with columns 'index', 'period', 'neuron', 'time'.
@@ -48,9 +45,7 @@ def init_out_spikes(spikes):
         pl.DataFrame: Processed spikes with additional columns 'f_index' and 'time_prev' for tracking firing events and refractory periods.
 
     Notes:
-        - f_index provides sequential numbering of spikes
-        - time_prev gives the time of the previous spike for refractory calculations
-        - Handles periodic boundary conditions using modulo arithmetic
+        The firing indices provide sequential numbering of spikes that is useful for grouping states.
     """
     return spikes.sort("time").select(
         pl.col("index"),
@@ -67,34 +62,30 @@ def init_out_spikes(spikes):
     )
 
 
-def compute_states(synapses, out_spikes, src_spikes):
+def compute_states(
+    synapses: pl.DataFrame, out_spikes: pl.DataFrame, src_spikes: pl.DataFrame
+) -> pl.DataFrame:
     """Compute all neuronal states for analysis.
 
-    Calculates the complete set of neuronal states including synaptic transmission
-    events, refractory periods, and firing events. Combines all state types and
-    performs temporal scanning to compute membrane potential coefficients.
+    Calculates the complete set of neuronal states including synaptic transmission events, refractory periods, and firing events. Combines all state types and performs temporal scanning to compute membrane potential coefficients.
 
     Args:
-        synapses (pl.DataFrame): Synaptic connections with columns including
-            'source', 'target', 'delay', 'weight'.
-        out_spikes (pl.DataFrame): Output spike data with columns 'index', 'period', 'neuron',
-            'f_index', 'time', 'time_prev'.
-        src_spikes (pl.DataFrame): Source spike data with columns 'index', 'period', 'neuron',
-            'time'.
+        synapses (pl.DataFrame): Synaptic connections with columns including 'source', 'target', 'delay', 'weight'.
+        out_spikes (pl.DataFrame): Output spike data with columns 'index', 'period', 'neuron', 'f_index', 'time', 'time_prev'. Must be sorted by time within each (index, neuron) group.
+        src_spikes (pl.DataFrame): Source spike data with columns 'index', 'period', 'neuron', 'time'.
 
     Returns:
-        pl.DataFrame: Complete state representation with temporal dynamics including
-            membrane potential coefficients (coef_0, coef_1) and state durations.
+        pl.DataFrame: Complete state representation with temporal dynamics with columns including 'index', 'neuron', 'f_index', 'start', 'length', 'coef_0', and 'coef_1'.
 
     Notes:
-        Integrates multiple state types:
+        The states are sorted by time with each firing index group and integrates multiple state types:
         - Refractory states from previous spikes
         - Synaptic transmission states from incoming connections
         - Firing states at exact spike times
     """
     # Origins per (index, neuron)
     origins = out_spikes.group_by(["index", "neuron"]).agg(
-        pl.min("time_prev").alias("time_origin")
+        pl.first("time_prev").alias("time_origin")
     )
 
     # Refractoriness
@@ -103,7 +94,6 @@ def compute_states(synapses, out_spikes, src_spikes):
         pl.col("neuron"),
         pl.col("f_index"),
         pl.col("time_prev").alias("start"),
-        pl.lit(None, pl.UInt32).alias("in_index"),
         pl.lit(REFRACTORY_RESET, pl.Float64).alias("in_coef_0"),
         pl.lit(0.0, pl.Float64).alias("in_coef_1"),
     )
@@ -121,20 +111,22 @@ def compute_states(synapses, out_spikes, src_spikes):
                 pl.col("period"),
                 pl.col("time_origin"),
             ).alias("start"),
-            pl.col("in_index"),
             pl.lit(0.0, pl.Float64).alias("in_coef_0"),
             pl.col("weight").alias("in_coef_1"),
         )
     )
 
-    in_states = syn_states.extend(rec_states).select(
-        pl.col("index"),
-        pl.col("neuron"),
-        pl.col("f_index").forward_fill().over(["index", "neuron"], order_by="start"),
-        pl.col("start"),
-        pl.col("in_index"),
-        pl.col("in_coef_0"),
-        pl.col("in_coef_1"),
+    in_states = (
+        syn_states.extend(rec_states)
+        .sort("index", "neuron", "start")
+        .select(
+            pl.col("index"),
+            pl.col("neuron"),
+            pl.col("f_index").forward_fill().over(["index", "neuron"]),
+            pl.col("start"),
+            pl.col("in_coef_0"),
+            pl.col("in_coef_1"),
+        )
     )
 
     f_states = out_spikes.select(
@@ -142,25 +134,22 @@ def compute_states(synapses, out_spikes, src_spikes):
         pl.col("neuron"),
         pl.col("f_index"),
         pl.col("time").alias("start"),
-        pl.lit(None, pl.UInt32).alias("in_index"),
         pl.lit(None, pl.Float64).alias("in_coef_0"),
         pl.lit(None, pl.Float64).alias("in_coef_1"),
     )
 
-    states = in_states.extend(f_states).sort("index", "neuron", "start")
+    states = in_states.extend(f_states).sort("f_index", "start")
+
     return scan_states(states)
 
 
-def scan_states(states):
+def scan_states(states: pl.DataFrame) -> pl.DataFrame:
     """Scan states to compute membrane potential coefficients with temporal dynamics.
 
-    Performs temporal scanning of neuronal states to compute the membrane potential
-    coefficients (coef_0, coef_1) that describe the linear evolution of the potential
-    between discrete events with exponential decay.
+    Performs temporal scanning of neuronal states to compute the membrane potential coefficients (coef_0, coef_1) that describe the linear evolution of the potential between discrete events with exponential decay.
 
     Args:
-        states (pl.DataFrame): Neuronal states with columns 'f_index', 'start',
-            'in_coef_0', 'in_coef_1' and temporal ordering.
+        states (pl.DataFrame): Neuronal states with columns 'f_index', 'start', 'in_coef_0', 'in_coef_1' and temporal ordering. Must be sorted by starting time within each firing index group.
 
     Returns:
         pl.DataFrame: States with added columns:
@@ -169,21 +158,19 @@ def scan_states(states):
             - coef_1: Linear term of membrane potential
 
     Notes:
-        Uses exponential decay scanning to accumulate the effects of synaptic
-        inputs over time. The coefficients describe how the membrane potential
-        evolves as z(start + dt) = (coef_0 + coef_1 * dt) * exp(- dt) for 0 <= dt < length.
+        Uses exponential decay scanning to accumulate the effects of synaptic inputs over time. The coefficients describe how the membrane potential evolves as z(start + dt) = (coef_0 + coef_1 * dt) * exp(- dt) for 0 <= dt < length.
     """
     return (
         states.with_columns(
             pl.col("start")
             .diff()
             .shift(-1, fill_value=0.0)
-            .over("f_index", order_by="start")
+            .over("f_index")
             .alias("length")
         )
         .with_columns(
             rp.scan_coef_1(pl.col("length").shift(), pl.col("in_coef_1"))
-            .over("f_index", order_by="start")
+            .over("f_index")
             .alias("coef_1")
         )
         .with_columns(
@@ -192,7 +179,7 @@ def scan_states(states):
                 pl.col("coef_1").shift(),
                 pl.col("in_coef_0"),
             )
-            .over("f_index", order_by="start")
+            .over("f_index")
             .alias("coef_0")
         )
     )
@@ -201,14 +188,12 @@ def scan_states(states):
 def compute_linear_map(n_synapses, syn_states, rec_states, times, deriv=0):
     """Compute linear mapping for membrane potential constraints.
 
-    Calculates the linear relationship between synaptic weights and membrane
-    potential (or its derivatives) at specified times, e.g., to enforce firing
-    constraints and sufficient rise conditions in optimization.
+    Calculates the linear relationship between synaptic weights and membrane potential (or its derivatives) at specified times, e.g., to enforce firing constraints and sufficient rise conditions in optimization.
 
     Args:
         n_synapses (int): Total number of synapses for sparse matrix dimensions.
         syn_states (pl.DataFrame): Synaptic states with columns 'f_index', 'start', 'in_index'.
-        rec_states (pl.DataFrame): Refractory states with columns 'f_index', 'start', 'weight'.
+        rec_states (pl.DataFrame): Refractory states with columns 'f_index', 'start'.
         times (pl.DataFrame): Evaluation times with columns 'f_index', 'time'.
         deriv (int, optional): Derivative order. Defaults to 0.
 
@@ -244,11 +229,9 @@ def compute_linear_map(n_synapses, syn_states, rec_states, times, deriv=0):
         .group_by("t_index")
         .agg(
             (
-                (
-                    (-1) ** (deriv % 2)
-                    * pl.col("weight")
-                    * (pl.col("start") - pl.col("time")).exp()
-                ).sum()
+                ((pl.col("start") - pl.col("time")).exp()).sum()
+                * (-1) ** (deriv % 2)
+                * REFRACTORY_RESET
             ).alias("coef"),
         )
     )

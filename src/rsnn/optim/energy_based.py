@@ -20,42 +20,39 @@ logger = setup_logging(__name__, console_level="INFO", file_level="DEBUG")
 def compute_states(synapses, out_spikes, src_spikes):
     """Compute input states for synaptic transmission and refractoriness.
 
-    Calculates state transitions for neuronal dynamics including synaptic inputs
-    and refractory periods. The function processes synaptic transmission events
-    and refractory reset states separately, then combines them.
+    Calculates state transitions for neuronal dynamics including synaptic inputs and refractory periods. The function processes synaptic transmission events and refractory reset states separately, then combines them.
 
     Args:
-        synapses (pl.DataFrame): Synaptic connections with columns including
-            'in_index', 'source', 'target', 'delay', 'weight'.
-        out_spikes (pl.DataFrame): Output spike times with columns including 'index',
-            'f_index', 'time_prev', 'period'.
-        src_spikes (pl.DataFrame): Source spike times with columns including 'index', 'neuron', 'time', 'period'.
+        synapses (pl.DataFrame): Synaptic connections with columns including 'in_index', 'source', 'target', 'delay', 'weight'.
+        out_spikes (pl.DataFrame): Output spike times with columns including 'index', 'period', 'neuron', 'f_index', 'time', 'time_prev'. Must be sorted by time within each (index, neuron) group.
+        src_spikes (pl.DataFrame): Source spike times with columns including 'index', 'period', 'neuron', 'time'.
 
     Returns:
         tuple[pl.DataFrame, pl.DataFrame]: A tuple containing:
-            - syn_states: Synaptic input states with in_index
-            - rec_states: Refractory states without in_index
+            - syn_states: Synaptic input states with columns 'f_index', 'in_index', 'start'
+            - rec_states: Refractory states with columns 'f_index', 'start'
     """
     # Set the time origins per index
-    origins = out_spikes.group_by("index").agg(pl.min("time_prev").alias("time_origin"))
+    origins = out_spikes.group_by(["index", "neuron"]).agg(
+        pl.first("time_prev").alias("time_origin")
+    )
 
     # Refractoriness
     rec_states = out_spikes.select(
         pl.col("index"),
+        pl.col("neuron"),
         pl.col("f_index"),
         pl.col("time_prev").alias("start"),
         pl.lit(None, pl.UInt32).alias("in_index"),
-        pl.lit(REFRACTORY_RESET, pl.Float64).alias("weight"),
-        pl.lit(1.0, pl.Float64).alias("in_coef_0"),
-        pl.lit(0.0, pl.Float64).alias("in_coef_1"),
     )
 
     # Synaptic transmission
     syn_states = (
-        synapses.join(src_spikes, left_on="source", right_on="neuron")
-        .join(origins, on="index")
+        origins.join(synapses, left_on="neuron", right_on="target")
+        .join(src_spikes, left_on=["index", "source"], right_on=["index", "neuron"])
         .select(
             pl.col("index"),
+            pl.col("neuron"),
             pl.lit(None, pl.UInt32).alias("f_index"),
             modulo_with_offset(
                 pl.col("time") + pl.col("delay"),
@@ -63,20 +60,18 @@ def compute_states(synapses, out_spikes, src_spikes):
                 pl.col("time_origin"),
             ).alias("start"),
             pl.col("in_index"),
-            pl.col("weight"),
-            pl.lit(0.0, pl.Float64).alias("in_coef_0"),
-            pl.lit(1.0, pl.Float64).alias("in_coef_1"),
         )
     )
 
     # All input states
-    in_states = syn_states.extend(rec_states).select(
-        pl.col("f_index").forward_fill().over("index", order_by="start"),
-        pl.col("start"),
-        pl.col("in_index"),
-        pl.col("weight"),
-        pl.col("in_coef_0"),
-        pl.col("in_coef_1"),
+    in_states = (
+        syn_states.extend(rec_states)
+        .sort("index", "neuron", "start")
+        .select(
+            pl.col("f_index").forward_fill().over(["index", "neuron"]),
+            pl.col("start"),
+            pl.col("in_index"),
+        )
     )
 
     return (
@@ -94,19 +89,14 @@ def compute_energy_metrics(
 ):
     """Compute energy-based metrics for synaptic weights optimization.
 
-    Calculates the weighted mean (linear term) and precision matrix (quadratic term)
-    for the energy-based objective function. The metric can be computed either
-    synapse-locally (diagonal) or neuron-locally (full matrix).
+    Calculates the weighted mean (linear term) and precision matrix (quadratic term) for the energy-based objective function. The metric can be computed either synapse-locally (diagonal) or neuron-locally (full matrix).
 
     Args:
         n_synapses (int): Number of synapses to optimize.
-        syn_states (pl.DataFrame): Synaptic states containing 'f_index',
-            'in_index', 'start'.
-        rec_states (pl.DataFrame): Refractory states containing 'f_index',
-            'start', 'weight'.
+        syn_states (pl.DataFrame): Synaptic states containing 'f_index', 'in_index', 'start'.
+        rec_states (pl.DataFrame): Refractory states containing 'f_index', 'start', 'weight'.
         out_spikes (pl.DataFrame): Output spikes containing 'f_index', 'time'.
-        syn_loc (bool): If True, use synapse-local (diagonal) metric.
-            If False, use neuron-local (full) metric.
+        syn_loc (bool): If True, use synapse-local (diagonal) metric. Otherwise, use neuron-local (full) metric.
 
     Returns:
         tuple[np.ndarray | None, np.ndarray]: A tuple containing:
@@ -172,11 +162,9 @@ def compute_energy_metrics(
                     rp.energy_rec_to_syn_metric(
                         pl.col("start") - pl.col("start_right"),
                         pl.col("time") - pl.col("start"),
-                    )
-                    * pl.col("weight")
-                )
-                .sum()
-                .alias("coef")
+                    ).sum()
+                    * REFRACTORY_RESET
+                ).alias("coef")
             )
         )
         weighted_mean = dataframe_to_1d_array(
@@ -203,22 +191,17 @@ def optimize(
     different energy metrics based on the specified parameters.
 
     Args:
-        synapses (pl.DataFrame): Synaptic connections with columns including
-            'source', 'target', 'delay', 'weight'.
+        synapses (pl.DataFrame): Synaptic connections with columns including 'source', 'target', 'delay'.
         spikes (pl.DataFrame): Spike train data with columns 'index', 'neuron', 'time'.
         wmin (float, optional): Minimum synaptic weight bound. Defaults to -inf.
         wmax (float, optional): Maximum synaptic weight bound. Defaults to inf.
-        syn_loc (bool, optional): If True, use synapse-local (diagonal) energy metric.
-            If False, use neuron-local (full) energy metric. Defaults to True.
-        lin_rec (bool, optional): If True, include linear recovery term in the
-            energy metric. Defaults to False.
+        syn_loc (bool, optional): If True, use synapse-local (diagonal) energy metric. Otherwise, use neuron-local (full) energy metric. Defaults to True.
+        lin_rec (bool, optional): If True, include linear recovery term in the energy metric. Defaults to False.
         l2_reg (float, optional): L2 regularization coefficient. Defaults to 0.0.
-        dzmin (float, optional): Minimum derivative constraint for sufficient rise
-            at firing times. Defaults to 1e-6.
+        dzmin (float, optional): Minimum derivative constraint for sufficient rise at firing times. Defaults to 1e-6.
 
     Returns:
-        pl.DataFrame: Optimized synapses as a DataFrame with columns 'source', 'target', 'delay', 'weight'.
-            If optimization fails for any neuron, returns synapses with 'weight' set to None.
+        pl.DataFrame: Optimized synapses as a DataFrame with columns 'source', 'target', 'delay', 'weight'. If optimization fails for any neuron, returns original synapses with 'weight' set to None.
 
     Raises:
         ValueError: If eps < 0, zmax > FIRING_THRESHOLD, dzmin < 0, or wmin >= wmax.
@@ -282,7 +265,7 @@ def optimize(
             out_spikes.select("f_index", "time"),
             deriv=1,
         )
-        model.addConstr(syn_lin_map @ weights + rec_lin_offset >= dzmin)
+        model.addConstr(syn_lin_map @ weights + rec_lin_offset >= dzmin)  # type: ignore
         logger.debug(f"Neuron {neuron}. Firing constraints added.")
 
         model.optimize()

@@ -42,9 +42,7 @@ def pmf_n_f_times(
 def expected_n_f_times(period: float, rate: float) -> float:
     """Compute expected number of spikes in a periodic spike train.
 
-    Calculates the expected number of spikes that can occur within one period
-    of a periodic spike train, taking into account the firing rate and
-    refractory period constraints.
+    Calculates the expected number of spikes that can occur within one period of a periodic spike train, taking into account the firing rate and refractory period constraints.
 
     Args:
         period (float): Period of the spike train in time units.
@@ -54,8 +52,7 @@ def expected_n_f_times(period: float, rate: float) -> float:
         float: Expected number of spikes in one period.
 
     Notes:
-        Uses the probability mass function from pmf_n_f_times to compute
-        the weighted average of possible spike counts.
+        Uses the probability mass function from pmf_n_f_times to compute the weighted average of possible spike counts.
     """
     ns, pns = pmf_n_f_times(period, rate)
     return np.inner(ns, pns)
