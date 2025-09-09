@@ -210,9 +210,7 @@ def rand_jit_f_times(
             # fix odd indices and sample the even ones
             tmin[1:] = jit_f_times[:-1] + REFRACTORY_PERIOD
             tmax[:-1] = jit_f_times[1:] - REFRACTORY_PERIOD
-            print(
-                f"Sampling even indices around {jit_f_times[even]} within {tmin[even]} -- {tmax[even]}"
-            )
+
             jit_f_times[even] = sampler(
                 tmin[even],
                 tmax[even],
@@ -222,9 +220,7 @@ def rand_jit_f_times(
             # fix even indices and sample odd ones
             tmin[1:] = jit_f_times[:-1] + REFRACTORY_PERIOD
             tmax[:-1] = jit_f_times[1:] - REFRACTORY_PERIOD
-            print(
-                f"Sampling odd indices around {jit_f_times[odd]} within {tmin[odd]} -- {tmax[odd]}"
-            )
+
             jit_f_times[odd] = sampler(
                 tmin[odd],
                 tmax[odd],

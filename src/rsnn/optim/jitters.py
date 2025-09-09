@@ -42,7 +42,7 @@ def compute_Phi(synapses, spikes):
             pl.col("period"),
             pl.col("time") - pl.col("period"),
         )
-        .over("neuron")
+        .over("neuron", order_by="time")
         .alias("time_prev"),
     )
 

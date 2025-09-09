@@ -1,6 +1,6 @@
 from collections import defaultdict
 
-import gurobipy as gp
+import gurobipy as gp  # type: ignore
 
 GUROBI_STATUS = defaultdict(lambda: "unknown status")
 GUROBI_STATUS[gp.GRB.OPTIMAL] = "optimal"

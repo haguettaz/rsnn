@@ -4,5 +4,6 @@ requires = [
     "setuptools>=80.9", 
     "wheel", 
     "pybind11>=3.0",
+    "maturin"
 ]
 build-backend = "setuptools.build_meta"

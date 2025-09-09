@@ -47,7 +47,7 @@ def compute_states(synapses, out_spikes, src_spikes, eps):
         - Refractory states from previous spikes
         - Synaptic states from incoming connections
     """
-    if eps < 0:
+    if eps <= 0:
         raise ValueError("epsilon must be positive.")
 
     # Set the time origins per index
@@ -167,10 +167,10 @@ def optimize(
 
     Returns:
         pl.DataFrame: Optimized synapses as a DataFrame with columns 'source', 'target', 'delay', 'weight'.
+            If optimization fails for any neuron, returns synapses with 'weight' set to None.
 
     Raises:
         ValueError: If eps < 0, zmax > FIRING_THRESHOLD, dzmin < 0, or wmin >= wmax.
-        RuntimeError: If optimization fails.
 
     Notes:
         The optimization alternates between:
@@ -235,9 +235,10 @@ def optimize(
             model.optimize()
 
             if model.status != gp.GRB.OPTIMAL:
-                raise RuntimeError(
+                logger.error(
                     f"Neuron {neuron}. Optimization failed: {GUROBI_STATUS[model.status]}"
                 )
+                return synapses.with_columns(pl.lit(None, pl.Float64).alias("weight"))
 
             states = scan_with_new_weights(states, weights.X)
 

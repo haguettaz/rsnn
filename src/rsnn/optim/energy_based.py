@@ -217,11 +217,11 @@ def optimize(
             at firing times. Defaults to 1e-6.
 
     Returns:
-        pl.DataFrame: Optimized synapses as a DataFrame.
+        pl.DataFrame: Optimized synapses as a DataFrame with columns 'source', 'target', 'delay', 'weight'.
+            If optimization fails for any neuron, returns synapses with 'weight' set to None.
 
     Raises:
-        ValueError: If wmin >= wmax.
-        RuntimeError: If optimization fails.
+        ValueError: If eps < 0, zmax > FIRING_THRESHOLD, dzmin < 0, or wmin >= wmax.
     """
     if wmin >= wmax:
         raise ValueError("wmin must be less than wmax.")
