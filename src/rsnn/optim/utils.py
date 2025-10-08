@@ -1,6 +1,10 @@
+from typing import Callable
+
+import gurobipy as gp
 import numpy as np
 import polars as pl
 import scipy.sparse as ss
+from numpy.typing import NDArray
 
 import rsnn_plugin as rp
 from rsnn import REFRACTORY_RESET
@@ -185,7 +189,13 @@ def scan_states(states: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def compute_linear_map(n_synapses, syn_states, rec_states, times, deriv=0):
+def compute_linear_map(
+    n_synapses: int,
+    syn_states: pl.DataFrame,
+    rec_states: pl.DataFrame,
+    times: pl.DataFrame,
+    deriv: int = 0,
+) -> Callable[[gp.MVar], gp.LinExpr]:
     """Compute linear mapping for membrane potential constraints.
 
     Calculates the linear relationship between synaptic weights and membrane potential (or its derivatives) at specified times, e.g., to enforce firing constraints and sufficient rise conditions in optimization.
@@ -201,13 +211,7 @@ def compute_linear_map(n_synapses, syn_states, rec_states, times, deriv=0):
         tuple[scipy.sparse.csr_array, np.ndarray]: A tuple containing:
             - Sparse matrix mapping synaptic weights to membrane potential
             - Offset vector from refractory contributions
-
-    Notes:
-        The linear map enables constraint formulation as:
-        syn_lin_map @ weights + rec_lin_offset {==, >=, <=} threshold
     """
-    times = times.with_row_index("t_index")
-
     syn_coef = (
         times.join(syn_states, on="f_index")
         .filter(pl.col("time") >= pl.col("start"))
@@ -236,19 +240,131 @@ def compute_linear_map(n_synapses, syn_states, rec_states, times, deriv=0):
         )
     )
 
-    return (
-        ss.csr_array(
+    A = ss.csr_array(
+        (
+            (syn_coef.get_column("coef").to_numpy()),
             (
-                (syn_coef.get_column("coef").to_numpy()),
-                (
-                    syn_coef.get_column("t_index").to_numpy(),
-                    syn_coef.get_column("in_index").to_numpy(),
-                ),
+                syn_coef.get_column("t_index").to_numpy(),
+                syn_coef.get_column("in_index").to_numpy(),
             ),
-            shape=(times.height, n_synapses),
         ),
-        rec_offset.sort("t_index").get_column("coef").to_numpy(),
+        shape=(times.height, n_synapses),
     )
+
+    b = rec_offset.sort("t_index").get_column("coef").to_numpy()
+
+    return lambda x_: A @ x_ + b  # type: ignore
+
+
+def find_max_violations(states: pl.DataFrame) -> pl.DataFrame:
+    return (
+        states.with_columns(
+            rp.critical_dtime(
+                pl.col("length"),
+                pl.col("coef_0"),
+                pl.col("coef_1"),
+                pl.col("rhs_coef_1"),
+            ).alias("dtc")
+        )
+        .with_columns(
+            (
+                (pl.col("coef_0") + pl.col("coef_1") * pl.col("dtc"))
+                * (-pl.col("dtc")).exp()
+                - (pl.col("rhs_coef_0") + pl.col("rhs_coef_1") * pl.col("dtc"))
+            ).alias("vdtc"),
+            (pl.col("coef_0") - pl.col("rhs_coef_0")).alias("vstart"),
+            (
+                (
+                    pl.col("coef_0")
+                    + pl.col("coef_1") * (pl.col("length") - 1e-9).clip(0.0)
+                )
+                * (-(pl.col("length") - 1e-9).clip(0.0)).exp()
+                - (
+                    pl.col("rhs_coef_0")
+                    + pl.col("rhs_coef_1") * (pl.col("length") - 1e-9).clip(0.0)
+                )
+            ).alias("vend"),
+        )
+        .with_columns(
+            pl.when(pl.col("dtc").is_null())
+            .then(
+                pl.when(pl.col("vstart") >= pl.col("vend"))
+                .then(pl.lit(0.0))
+                .otherwise("length")
+            )
+            .otherwise(pl.col("dtc"))
+            .alias("dtime")
+        )
+        .with_columns(
+            (pl.col("start") + pl.col("dtime")).alias("tmax"),
+            (
+                (pl.col("coef_0") + pl.col("coef_1") * pl.col("dtime"))
+                * (-pl.col("dtime")).exp()
+                # - (pl.col("rhs_coef_0") + pl.col("rhs_coef_1") * pl.col("dtime"))
+            ).alias("zmax"),
+            (pl.col("rhs_coef_0") + pl.col("rhs_coef_1") * pl.col("dtime")).alias(
+                "bound"
+            ),
+        )
+        .filter(pl.col("zmax") > pl.col("bound"))
+        .group_by("f_index")
+        .agg(
+            pl.col("tmax", "zmax", "bound").top_k_by(
+                pl.col("zmax") - pl.col("bound"), k=1
+            )
+        )
+        .explode("tmax", "zmax", "bound")
+    )
+
+
+# return (
+#     states.with_columns(
+#         rp.critical_dtime(
+#             pl.col("length"),
+#             pl.col("coef_0"),
+#             pl.col("coef_1"),
+#             pl.col("rhs_coef_1"),
+#         ).alias("dtc")
+#     )
+#     .with_columns(
+#         (
+#             (pl.col("coef_0") + pl.col("coef_1") * pl.col("dtc"))
+#             * (-pl.col("dtc")).exp()
+#             - (pl.col("rhs_coef_0") + pl.col("rhs_coef_1") * pl.col("dtc"))
+#         ).alias("vdtc"),
+#         (pl.col("coef_0") - pl.col("rhs_coef_0")).alias("vstart"),
+#         (
+#             (pl.col("coef_0") + pl.col("coef_1") * pl.col("length"))
+#             * (-pl.col("length")).exp()
+#             - (pl.col("rhs_coef_0") + pl.col("rhs_coef_1") * pl.col("length"))
+#         ).alias("vend"),
+#     )
+#     .with_columns(
+#         pl.when(pl.col("dtc").is_null())
+#         .then(
+#             pl.when(pl.col("vstart") >= pl.col("vend"))
+#             .then(pl.lit(0.0))
+#             .otherwise("length")
+#         )
+#         .otherwise(pl.col("dtc"))
+#         .alias("dtime")
+#     )
+#     .with_columns(
+#         (pl.col("start") + pl.col("dtime")).alias("tmax"),
+#         (
+#             (pl.col("coef_0") + pl.col("coef_1") * pl.col("dtime"))
+#             * (-pl.col("dtime")).exp()
+#             - (pl.col("rhs_coef_0") + pl.col("rhs_coef_1") * pl.col("dtime"))
+#         ).alias("vmax"),
+#         (pl.col("rhs_coef_0") + pl.col("dtime") * pl.col("rhs_coef_1")).alias(
+#             "bound"
+#         ),
+#     )
+#     .filter(pl.col("vmax") > 0.0)
+#     .group_by("f_index")
+#     .agg(pl.col("tmax", "vmax", "bound").top_k_by("vmax", k=1))
+#     .explode("tmax", "vmax", "bound")
+# )
 
 
 def modulo_with_offset(x, period, offset):
@@ -272,7 +388,9 @@ def modulo_with_offset(x, period, offset):
     return (x - offset).mod(period) + offset
 
 
-def dataframe_to_1d_array(dataframe, index, value, shape):
+def dataframe_to_1d_array(
+    dataframe: pl.DataFrame, index: str, value: str, shape: int
+) -> NDArray[np.float64]:
     """Convert DataFrame columns to a 1D numpy array with specified indexing.
 
     Creates a zero-initialized array and populates it using DataFrame values
@@ -298,7 +416,54 @@ def dataframe_to_1d_array(dataframe, index, value, shape):
     return arr
 
 
-def dataframe_to_sym_2d_array(dataframe, index_row, index_col, value, shape):
+def dataframe_to_2d_array(
+    dataframe: pl.DataFrame,
+    index_row: str,
+    index_col: str,
+    value: str,
+    shape: tuple[int, int],
+) -> ss.csr_array[np.float64]:
+    """Convert DataFrame to a symmetric 2D sparse array.
+
+    Creates a symmetric sparse matrix from DataFrame data by constructing
+    the upper/lower triangle and then symmetrizing. Useful for creating
+    precision matrices and other symmetric structures from sparse data.
+
+    Args:
+        dataframe (pl.DataFrame): Input DataFrame with row index, column index,
+            and value columns.
+        index_row (str): Column name containing row indices.
+        index_col (str): Column name containing column indices.
+        value (str): Column name containing matrix values.
+        shape (tuple[int, int]): Shape of the output matrix (rows, cols).
+
+    Returns:
+        scipy.sparse.csr_array: Symmetric sparse matrix where
+            result[i,j] = result[j,i] for all valid i,j.
+
+    Notes:
+        The symmetrization is performed as: A + A.T - diag(A)
+        This avoids double-counting diagonal elements while ensuring symmetry.
+    """
+    return ss.csr_array(
+        (
+            (dataframe.get_column(value).to_numpy()),
+            (
+                dataframe.get_column(index_row).to_numpy(),
+                dataframe.get_column(index_col).to_numpy(),
+            ),
+        ),
+        shape=shape,
+    )
+
+
+def dataframe_to_sym_2d_array(
+    dataframe: pl.DataFrame,
+    index_row: str,
+    index_col: str,
+    value: str,
+    shape: tuple[int, int],
+) -> NDArray[np.float64]:
     """Convert DataFrame to a symmetric 2D sparse array.
 
     Creates a symmetric sparse matrix from DataFrame data by constructing

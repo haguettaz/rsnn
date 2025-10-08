@@ -11,7 +11,6 @@ from rsnn.optim import GUROBI_STATUS
 from rsnn.optim.utils import (
     compute_linear_map,
     dataframe_to_1d_array,
-    dataframe_to_2d_array,
     init_out_spikes,
     init_synapses,
     modulo_with_offset,
@@ -87,64 +86,35 @@ def compute_objective(
     n_synapses: int,
     out_spikes: pl.DataFrame,
     syn_states: pl.DataFrame,
-    diag: bool = False,
     l2_reg: float = 1.0,
 ) -> Callable[[gp.MVar], gp.MQuadExpr]:
     """Compute energy-based metrics for synaptic weights optimization.
 
-    Calculates the weighted mean (linear term) and precision matrix (quadratic term) for the energy-based objective function.
-    The metric can be computed either synapse-locally (diagonal) or neuron-locally (full matrix).
+    Calculates the weighted mean (linear term) and precision matrix (quadratic term) for the energy-based objective function. The metric can be computed either synapse-locally (diagonal) or neuron-locally (full matrix).
 
     Args:
         n_synapses (int): Number of synapses to optimize.
         out_spikes (pl.DataFrame): Output spikes containing 'f_index', 'time'.
         syn_states (pl.DataFrame): Synaptic states containing 'f_index', 'in_index', 'start'.
-        diag (bool, optional): If True, use diagonal (synapse-local) quadratic term in the objective. Otherwise, use full quadratic term. Defaults to False.
         l2_reg (float, optional): L2 regularization coefficient. Defaults to 1.0.
 
     Returns:
         Callable[[gp.MVar], gp.MQuadExpr]: A quadratic function of the synaptic weights.
     """
-    if diag:
-        quad_map = dataframe_to_2d_array(
-            syn_states.join(syn_states, on=["f_index", "in_index"])
-            .join(out_spikes, on="f_index")
-            .group_by("in_index")
-            .agg(
-                rp.integrate_synaptic_inputs_pair(
-                    (pl.col("start") - pl.col("start_right")).abs(),
-                    pl.col("time")
-                    - pl.max_horizontal(pl.col("start"), pl.col("start_right")),
-                )
-                .sum()
-                .alias("coef")
-            ),
-            "in_index",
-            "in_index",
-            "coef",
-            (n_synapses, n_synapses),
-        )
-    else:
-        quad_map = dataframe_to_2d_array(
-            syn_states.join(syn_states, on="f_index")
-            .join(out_spikes, on="f_index")
-            .group_by(["in_index", "in_index_right"])
-            .agg(
-                rp.integrate_synaptic_inputs_pair(
-                    (pl.col("start") - pl.col("start_right")).abs(),
-                    pl.col("time")
-                    - pl.max_horizontal(pl.col("start"), pl.col("start_right")),
-                )
-                .sum()
-                .alias("coef")
-            ),
-            "in_index",
-            "in_index_right",
-            "coef",
-            (n_synapses, n_synapses),
-        )
+    lin_map = dataframe_to_1d_array(
+        syn_states.join(out_spikes, on="f_index")
+        .group_by("in_index")
+        .agg(
+            rp.integrate_synaptic_input(pl.col("time") - pl.col("start"))
+            .sum()
+            .alias("value")
+        ),
+        "in_index",
+        "value",
+        n_synapses,
+    )
 
-    return lambda x_: x_ @ quad_map @ x_ + l2_reg * (x_ @ x_)
+    return lambda x_: lin_map @ x_ + l2_reg * (x_ @ x_)
 
 
 def optimize(
@@ -152,7 +122,6 @@ def optimize(
     spikes,
     wmin=float("-inf"),
     wmax=float("inf"),
-    diag_obj=False,
     l2_reg=1e-1,
     dzmin=1e-6,
 ):
@@ -167,7 +136,6 @@ def optimize(
         spikes (pl.DataFrame): Spike train data with columns 'index', 'neuron', 'time'.
         wmin (float, optional): Minimum synaptic weight bound. Defaults to -inf.
         wmax (float, optional): Maximum synaptic weight bound. Defaults to inf.
-        diag_obj (bool, optional): If True, use diagonal (synapse-local) quadratic term in the objective. Otherwise, use full quadratic term. Defaults to False.
         l2_reg (float, optional): L2 regularization coefficient. Defaults to 1e-1.
         dzmin (float, optional): Minimum derivative constraint for sufficient rise at firing times. Defaults to 1e-6.
 
@@ -198,18 +166,8 @@ def optimize(
         syn_states, rec_states = compute_states(in_synapses, out_spikes, spikes)
 
         # Objective: to minimize an energy-based metric -- todo: optimize!!
-        quad_objective = compute_objective(
-            in_synapses.height,
-            out_spikes,
-            syn_states,
-            diag_obj,
-            l2_reg,
-        )
-        logger.debug(f"Neuron {neuron}. Energy metrics computed.")
-        model.setObjective(
-            quad_objective(weights),
-            sense=gp.GRB.MINIMIZE,
-        )
+        quad_obj = compute_objective(in_synapses.height, out_spikes, syn_states, l2_reg)
+        model.setObjective(quad_obj(weights), sense=gp.GRB.MINIMIZE)
         logger.debug(f"Neuron {neuron}. Objective function set.")
 
         # Firing constraints: exact crossing and sufficient rise
