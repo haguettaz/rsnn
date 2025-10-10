@@ -11,8 +11,8 @@ from rsnn.optim.utils import (
     find_max_violations,
     init_out_spikes,
     init_synapses,
-    modulo_with_offset,
 )
+from rsnn.utils import modulo_with_offset
 
 logger = setup_logging(__name__, console_level="INFO", file_level="DEBUG")
 

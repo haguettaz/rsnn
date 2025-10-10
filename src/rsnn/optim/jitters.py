@@ -4,7 +4,7 @@ import scipy.sparse as ss
 
 from rsnn import REFRACTORY_RESET
 from rsnn.log import setup_logging
-from rsnn.optim.utils import modulo_with_offset
+from rsnn.utils import modulo_with_offset
 
 # Set up logging
 logger = setup_logging(__name__, console_level="DEBUG", file_level="INFO")

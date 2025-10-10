@@ -6,17 +6,24 @@ import rsnn_plugin as rp
 from rsnn import FIRING_THRESHOLD, REFRACTORY_RESET
 from rsnn.log import setup_logging
 from rsnn.optim import GUROBI_STATUS
-from rsnn.optim.utils import compute_linear_map, init_out_spikes, init_synapses
+from rsnn.optim.utils import (
+    compute_linear_map,
+    find_max_violations,
+    init_out_spikes,
+    init_synapses,
+)
 from rsnn.utils import modulo_with_offset
 
 logger = setup_logging(__name__, console_level="INFO", file_level="DEBUG")
+
+MAX_LEVEL = 0.0  # Maximum level when not firing
 
 
 def compute_states(
     synapses: pl.DataFrame,
     out_spikes: pl.DataFrame,
     src_spikes: pl.DataFrame,
-    eps: float,
+    dzmin: float,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """Compute neuronal states for template-based optimization.
 
@@ -33,13 +40,7 @@ def compute_states(
             - syn_states: Synaptic transmission states with columns 'f_index', 'in_index', 'start'
             - rec_states: Refractory states with columns 'f_index', 'start'
             - states: All states with columns 'f_index', 'start', 'in_index', 'weight', 'in_coef_0', 'in_coef_1', 'active', 'length', and sorted by start time over each firing index group.
-
-    Raises:
-        ValueError: If eps is not positive.
     """
-    if eps <= 0:
-        raise ValueError("epsilon must be positive.")
-
     # Set the time origins per index
     origins = out_spikes.group_by(["index", "neuron"]).agg(
         pl.first("time_prev").alias("time_origin")
@@ -53,9 +54,10 @@ def compute_states(
         pl.lit(None, pl.Float64).alias("weight"),
         pl.lit(None, pl.Float64).alias("in_coef_0"),
         pl.lit(None, pl.Float64).alias("in_coef_1"),
-        pl.lit(True, pl.Boolean).alias("active"),
+        # pl.lit(False, pl.Boolean).alias("constr"),
     )
 
+    eps = (FIRING_THRESHOLD - MAX_LEVEL) / dzmin
     before_f_states = out_spikes.select(
         pl.col("f_index"),
         (pl.col("time") - eps).clip(pl.col("time_prev")).alias("start"),
@@ -63,7 +65,9 @@ def compute_states(
         pl.lit(None, pl.Float64).alias("weight"),
         pl.lit(None, pl.Float64).alias("in_coef_0"),
         pl.lit(None, pl.Float64).alias("in_coef_1"),
-        pl.lit(True, pl.Boolean).alias("active"),
+        # pl.lit(True, pl.Boolean).alias("active"),
+        pl.lit(MAX_LEVEL, pl.Float64).alias("rhs_coef_0"),
+        pl.lit(dzmin, pl.Float64).alias("rhs_coef_1"),
     )
 
     # Refractoriness
@@ -109,17 +113,36 @@ def compute_states(
     )
 
     states = (
-        in_states.with_columns(pl.lit(None, pl.Boolean).alias("active"))
+        in_states.with_columns(
+            pl.lit(None, pl.Float64).alias("rhs_coef_0"),
+            pl.lit(None, pl.Float64).alias("rhs_coef_1"),
+        )
         .extend(before_f_states)
-        .extend(f_states)
+        .extend(
+            f_states.with_columns(
+                pl.lit(None, pl.Float64).alias("rhs_coef_0"),
+                pl.lit(None, pl.Float64).alias("rhs_coef_1"),
+            )
+        )
         .sort("start")
         .with_columns(
-            pl.col("active").forward_fill().fill_null(False).over("f_index"),
+            pl.col("rhs_coef_1").forward_fill().fill_null(0.0).over("f_index"),
             pl.col("start")
             .diff()
             .shift(-1, fill_value=0.0)
             .over("f_index")
             .alias("length"),
+        )
+        .with_columns(
+            (
+                (pl.col("length") * pl.col("rhs_coef_1"))
+                .cum_sum()
+                .shift(1)
+                .fill_null(0.0)
+                + MAX_LEVEL
+            )
+            .over("f_index")
+            .alias("rhs_coef_0"),
         )
     )
 
@@ -128,7 +151,7 @@ def compute_states(
             "f_index", "start", "in_index"
         ),
         in_states.filter(pl.col("in_index").is_null()).select("f_index", "start"),
-        states,
+        states,  # .filter(pl.col("length") > 0.0),
     )
 
 
@@ -137,11 +160,8 @@ def optimize(
     spikes: pl.DataFrame,
     wmin: float = float("-inf"),
     wmax: float = float("inf"),
-    eps: float = 0.2,
-    zmax: float = 0.0,
-    dzmin: float = 2.0,
+    dzmin: float = 1.0,
     n_iter: int = 1000,
-    feas_tol: float = 1e-5,
 ) -> pl.DataFrame:
     """Optimize synaptic weights using template-based iterative constraint refinement.
 
@@ -172,15 +192,6 @@ def optimize(
         2. Adding new constraints for detected violations in silent/active regions
         Converges when no more constraint violations are found.
     """
-    if eps <= 0:
-        raise ValueError("epsilon must be positive.")
-
-    if zmax > FIRING_THRESHOLD:
-        raise ValueError("zmax must be less than or equal to the firing threshold.")
-
-    if dzmin < 0:
-        raise ValueError("dzmin must be non-negative.")
-
     if wmin >= wmax:
         raise ValueError("wmin must be less than wmax.")
 
@@ -211,7 +222,7 @@ def optimize(
 
         # Compute states for linear constraints
         syn_states, rec_states, states = compute_states(
-            in_synapses, out_spikes, spikes, eps
+            in_synapses, out_spikes, spikes, dzmin
         )
 
         # Firing time constraints
@@ -219,9 +230,19 @@ def optimize(
             in_synapses.height,
             syn_states,
             rec_states,
-            out_spikes.select("f_index", "time"),
+            out_spikes.select("f_index", "time").with_row_index("t_index"),
         )
         model.addConstr(lin_map(weights) == FIRING_THRESHOLD)
+
+        lin_map = compute_linear_map(
+            in_synapses.height,
+            syn_states,
+            rec_states,
+            out_spikes.select("f_index", "time").with_row_index("t_index"),
+            deriv=1,
+        )
+        model.addConstr(lin_map(weights) >= dzmin)  # type: ignore
+
         logger.debug(f"Neuron {neuron}. Firing time constraints added.")
 
         for i in range(n_iter):
@@ -235,62 +256,29 @@ def optimize(
                 return synapses.with_columns(pl.lit(None, pl.Float64).alias("weight"))
 
             states = scan_with_new_weights(states, weights.X)  # type: ignore
+            # logger.info(states.filter(pl.col("coef_0") > FIRING_THRESHOLD))
 
             # 2. Refine constraints
-            silent_violations = (
-                states.filter(pl.col("active") == False)
-                .group_by("f_index")
-                .agg(
-                    rp.max_violation(
-                        pl.col("start"),
-                        pl.col("length"),
-                        pl.col("coef_0"),
-                        pl.col("coef_1"),
-                        vmax=feas_tol + zmax,
-                    ).alias("time")
-                )
-                .drop_nulls()
+            max_violations = find_max_violations(states)
+            logger.info(
+                f"Neuron {neuron}: iteration {i}. The objective is {model.getAttr('ObjVal')} for {model.getAttr('NumConstrs')} linear constraints; still {max_violations.height} violations to resolve."
             )
-            if silent_violations.height > 0:
+            # logger.info(max_violations)
+
+            if max_violations.height > 0:
+                max_violations = max_violations.with_row_index("t_index").with_columns(
+                    pl.col("tmax").alias("time")
+                )
                 lin_map = compute_linear_map(
                     in_synapses.height,
                     syn_states,
                     rec_states,
-                    silent_violations,
+                    max_violations,
                 )
+                zmax = max_violations.get_column("bound").to_numpy()  # type: ignore
                 model.addConstr(lin_map(weights) <= zmax)  # type: ignore
 
-            active_violations = (
-                states.filter(pl.col("active") == True)
-                .group_by("f_index")
-                .agg(
-                    rp.max_violation(
-                        pl.col("start"),
-                        pl.col("length"),
-                        (pl.col("coef_0") - pl.col("coef_1")),
-                        pl.col("coef_1"),
-                        vmax=feas_tol - dzmin,
-                    ).alias("time")
-                )
-                .drop_nulls()
-            )
-            if active_violations.height > 0:
-                lin_map = compute_linear_map(
-                    in_synapses.height,
-                    syn_states,
-                    rec_states,
-                    active_violations,
-                    deriv=1,
-                )
-                model.addConstr(lin_map(weights) >= dzmin)  # type: ignore
-
-            n_violations = active_violations.height + silent_violations.height
-
-            logger.debug(
-                f"Neuron {neuron}: iteration {i}. The objective is {model.getAttr('ObjVal')} for {model.getAttr('NumConstrs')} linear constraints. {n_violations} new linear constraints to add."
-            )
-
-            if n_violations == 0:
+            else:
                 logger.info(
                     f"Neuron {neuron}. Optimization successful (in {i} iterations)"
                 )

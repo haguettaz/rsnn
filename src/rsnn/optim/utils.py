@@ -9,6 +9,7 @@ from numpy.typing import NDArray
 import rsnn_plugin as rp
 from rsnn import REFRACTORY_RESET
 from rsnn.log import setup_logging
+from rsnn.utils import modulo_with_offset
 
 # from ..states import compute_max_violations
 
@@ -256,7 +257,7 @@ def compute_linear_map(
     return lambda x_: A @ x_ + b  # type: ignore
 
 
-def find_max_violations(states: pl.DataFrame) -> pl.DataFrame:
+def find_max_violations(states: pl.DataFrame, tol: float = 1e-6) -> pl.DataFrame:
     return (
         states.with_columns(
             rp.critical_dtime(
@@ -306,7 +307,7 @@ def find_max_violations(states: pl.DataFrame) -> pl.DataFrame:
                 "bound"
             ),
         )
-        .filter(pl.col("zmax") > pl.col("bound"))
+        .filter(pl.col("zmax") > pl.col("bound") + tol)
         .group_by("f_index")
         .agg(
             pl.col("tmax", "zmax", "bound").top_k_by(
@@ -365,27 +366,6 @@ def find_max_violations(states: pl.DataFrame) -> pl.DataFrame:
 #     .agg(pl.col("tmax", "vmax", "bound").top_k_by("vmax", k=1))
 #     .explode("tmax", "vmax", "bound")
 # )
-
-
-def modulo_with_offset(x, period, offset):
-    """Compute modulo operation with custom offset for periodic boundary conditions.
-
-    Performs modular arithmetic with a specified offset, useful for handling
-    periodic spike trains and temporal boundary conditions in neural simulations.
-
-    Args:
-        x (pl.Expr): Input values to apply modulo operation.
-        period (pl.Expr): Period for the modulo operation.
-        offset (pl.Expr): Offset value to define the modulo base.
-
-    Returns:
-        pl.Expr: Result of (x - offset) mod period + offset.
-
-    Notes:
-        Equivalent to: x - period * floor((x - offset) / period)
-        Useful for wrapping spike times within periodic boundaries.
-    """
-    return (x - offset).mod(period) + offset
 
 
 def dataframe_to_1d_array(
