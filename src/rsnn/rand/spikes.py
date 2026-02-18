@@ -60,8 +60,8 @@ def expected_n_f_times(period: float, rate: float) -> float:
 
 def rand_spikes(
     n_neurons: int,
-    periods: List[float],
-    rates: List[float],
+    period: float,
+    rate: float,
     rng: Optional[np.random.Generator] = None,
 ) -> pl.DataFrame:
     """Generate random multi-channel periodic spike trains.
@@ -72,8 +72,8 @@ def rand_spikes(
 
     Args:
         n_neurons (int): Number of neurons/channels to simulate.
-        periods (list[float]): List of period durations for each spike train pattern.
-        rates (list[float]): List of average firing rates per neuron (spikes per time unit).
+        period (float): Period duration for the spike train pattern.
+        rate (float): Average firing rate per neuron (spikes per time unit).
         rng (Optional[np.random.Generator], optional): Random number generator.
             If None, uses numpy's default_rng(). Defaults to None.
 
@@ -88,20 +88,18 @@ def rand_spikes(
         the refractory period constraint. Spikes are distributed uniformly
         within each period after accounting for refractory spacing.
     """
-    if any(period < 0.0 for period in periods):
-        raise ValueError(f"All periods should be non-negative.")
+    if period < 0.0:
+        raise ValueError(f"Period should be non-negative.")
 
-    if any(rate < 0.0 for rate in rates):
-        raise ValueError(f"All firing rates should be non-negative.")
+    if rate < 0.0:
+        raise ValueError(f"Firing rate should be non-negative.")
 
     if rng is None:
         rng = np.random.default_rng()
 
     spikes_lst = []
-    for i, (period, rate) in enumerate(zip(periods, rates)):
-        if period <= REFRACTORY_PERIOD or rate == 0.0:
-            continue
 
+    if period > REFRACTORY_PERIOD and rate > 0.0:
         ns, pns = pmf_n_f_times(period, rate)
 
         for l in range(n_neurons):
@@ -117,8 +115,6 @@ def rand_spikes(
                 spikes_lst.append(
                     pl.DataFrame(
                         [
-                            pl.Series("index", [i] * n, dtype=pl.UInt32),
-                            pl.Series("period", [period] * n, dtype=pl.Float64),
                             pl.Series("neuron", [l] * n, dtype=pl.UInt32),
                             pl.Series(
                                 "time", np.sort(new_f_times % period), dtype=pl.Float64
@@ -131,8 +127,6 @@ def rand_spikes(
         return pl.concat(spikes_lst)
     return pl.DataFrame(
         schema={
-            "index": pl.UInt32,
-            "period": pl.Float64,
             "neuron": pl.UInt32,
             "time": pl.Float64,
         }

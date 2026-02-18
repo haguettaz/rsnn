@@ -2,167 +2,312 @@ import gurobipy as gp
 import numpy as np
 import polars as pl
 
-import rsnn_plugin as rp
 from rsnn import FIRING_THRESHOLD, REFRACTORY_RESET
 from rsnn.log import setup_logging
 from rsnn.optim import GUROBI_STATUS
 from rsnn.optim.utils import (
-    compute_linear_map,
+    compute_1d_linear_map,
+    compute_nd_linear_map,
     find_max_violations,
-    init_out_spikes,
-    init_synapses,
+    scan_with_weights,
 )
-from rsnn.utils import modulo_with_offset
 
-logger = setup_logging(__name__, console_level="INFO", file_level="DEBUG")
-
-MIN_SLOPE = 1e-6  # Minimum slope at firing times
-MAX_LEVEL = FIRING_THRESHOLD - 1e-2  # Maximum level when not firing
-MIN_DIST_TO_FIRING = 1e-1  # Minimum distance to next firing to consider a state
+# SLOPE_MARGIN = 1e-6  # Minimum slope at firing times
+# LEVEL_MARGIN = 1e-6  # Maximum level when not firing
 
 
-def compute_states(
-    synapses: pl.DataFrame,
-    out_spikes: pl.DataFrame,
-    src_spikes: pl.DataFrame,
-) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    """Compute neuronal states for template-based optimization.
-
-    Calculates different types of states needed for the template-based optimization: firing states, synaptic transmission states, and refractory states. Also computes before-firing states for constraint violations.
+def compute_template(
+    syn_states: pl.DataFrame,
+    rec_states: pl.DataFrame,
+    zmax: float,
+) -> pl.DataFrame:
+    """Compute neuronal states for naive optimization. Note that the last state before each firing is not included as not needed for the optimization process.
 
     Args:
-        synapses (pl.DataFrame): Synaptic connections with columns including 'source', 'target', 'delay'.
-        out_spikes (pl.DataFrame): Output spike times with columns 'index', 'period', 'neuron', 'f_index', 'time', 'time_prev'. Must be sorted by time within each (index, neuron) group.
-        src_spikes (pl.DataFrame): Source spike times with columns 'index', 'period', 'neuron', 'time'.
-        eps (float): Epsilon parameter for before-firing state timing.
+        syn_states (pl.DataFrame): Synaptic transmission states with columns 'f_index', 'start', and 'in_index'.
+        rec_states (pl.DataFrame): Refractory states with columns 'f_index', 'start', and 'weight'.
+        out_spikes (pl.DataFrame): Output spike data with columns 'index', 'f_index', 'time'.
+        threshold (float): Neuronal firing threshold.
+        dzmin (float): Minimum derivative at firing time.
+        zmax (float): Maximum membrane potential at rest.
 
     Returns:
-        tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]: A tuple containing:
-            - syn_states: Synaptic transmission states with columns 'f_index', 'in_index', 'start'
-            - rec_states: Refractory states with columns 'f_index', 'start'
-            - states: All states with columns 'f_index', 'start', 'in_index', 'weight', 'in_coef_0', 'in_coef_1', 'active', 'length', and sorted by start time over each firing index group.
+        pl.DataFrame: Neuronal states with columns 'f_index', 'in_index', 'start', 'length', 'weight', 'in_coef_0', 'in_coef_1', 'rhs_coef_0', and 'rhs_coef_1'. The DataFrame is sorted by time within each firing index group.
     """
-    # Set the time origins per index
-    origins = out_spikes.group_by(["index", "neuron"]).agg(
-        pl.first("time_prev").alias("time_origin")
-    )
-
-    # Firing states
-    f_states = out_spikes.select(
+    rec_states = rec_states.select(
         pl.col("f_index"),
-        pl.col("time").alias("start"),
+        pl.col("start"),
         pl.lit(None, pl.UInt32).alias("in_index"),
-        pl.lit(None, pl.Float64).alias("weight"),
-        pl.lit(None, pl.Float64).alias("in_coef_0"),
-        pl.lit(None, pl.Float64).alias("in_coef_1"),
-        # pl.lit(False, pl.Boolean).alias("constr"),
-    )
-
-    before_f_states = out_spikes.select(
-        pl.col("f_index"),
-        (pl.col("time") - MIN_DIST_TO_FIRING).clip(pl.col("time_prev")).alias("start"),
-        pl.lit(None, pl.UInt32).alias("in_index"),
-        pl.lit(None, pl.Float64).alias("weight"),
-        pl.lit(None, pl.Float64).alias("in_coef_0"),
-        pl.lit(None, pl.Float64).alias("in_coef_1"),
-        pl.lit(True, pl.Boolean).alias("constr"),
-    )
-
-    # Refractoriness
-    rec_states = out_spikes.select(
-        pl.col("index"),
-        pl.col("f_index"),
-        pl.col("time_prev").alias("start"),
-        pl.lit(None, pl.UInt32).alias("in_index"),
-        pl.lit(REFRACTORY_RESET, pl.Float64).alias("weight"),
+        pl.col("weight"),
         pl.lit(1.0, pl.Float64).alias("in_coef_0"),
         pl.lit(0.0, pl.Float64).alias("in_coef_1"),
     )
-
-    # Synaptic transmission
-    syn_states = (
-        origins.join(synapses, left_on="neuron", right_on="target")
-        .join(src_spikes, left_on=["index", "source"], right_on=["index", "neuron"])
-        .select(
-            pl.col("index"),
-            pl.lit(None, pl.UInt32).alias("f_index"),
-            modulo_with_offset(
-                pl.col("time") + pl.col("delay"),
-                pl.col("period"),
-                pl.col("time_origin"),
-            ).alias("start"),
-            pl.col("in_index"),
-            pl.lit(None, pl.Float64).alias("weight"),
-            pl.lit(0.0, pl.Float64).alias("in_coef_0"),
-            pl.lit(1.0, pl.Float64).alias("in_coef_1"),
-        )
+    syn_states = syn_states.select(
+        pl.col("f_index"),
+        pl.col("start"),
+        pl.col("in_index"),
+        pl.lit(None, pl.Float64).alias("weight"),
+        pl.lit(0.0, pl.Float64).alias("in_coef_0"),
+        pl.lit(1.0, pl.Float64).alias("in_coef_1"),
     )
     in_states = (
-        syn_states.extend(rec_states)
+        pl.concat([rec_states, syn_states])
         .sort("start")
-        .select(
-            pl.col("f_index").forward_fill().over("index"),
-            pl.col("start"),
-            pl.col("in_index"),
-            pl.col("weight"),
-            pl.col("in_coef_0"),
-            pl.col("in_coef_1"),
-        )
-    )
-
-    states = (
-        in_states.with_columns(pl.lit(None, pl.Boolean).alias("constr"))
-        .extend(before_f_states)
-        # .extend(f_states)
-        .sort("start")
-        .with_columns(pl.col("constr").backward_fill().over("f_index"))
-        .drop_nulls("constr")
         .with_columns(
-            pl.col("start")
-            .diff()
-            .shift(-1, fill_value=0.0)
-            .over("f_index")
-            .alias("length"),
-            pl.lit(MAX_LEVEL, pl.Float64).alias("rhs_coef_0"),
+            pl.col("start").diff().shift(-1).over("f_index").alias("length"),
+            pl.lit(zmax, pl.Float64).alias("rhs_coef_0"),
             pl.lit(0.0, pl.Float64).alias("rhs_coef_1"),
         )
+        .drop_nulls("length")
     )
 
-    return (
-        in_states.filter(pl.col("in_index").is_not_null()).select(
-            "f_index", "start", "in_index"
-        ),
-        in_states.filter(pl.col("in_index").is_null()).select("f_index", "start"),
-        states,
-    )
+    return in_states
+
+    # in_states = in_spikes.sort("time").select(
+    #     pl.col("f_index"),
+    #     pl.col("in_index"),
+    #     pl.col("time").alias("start"),
+    #     pl.col("time").diff().shift(-1).over("f_index").alias("length"),
+    #     pl.when(pl.col("in_index").is_null())
+    #     .then(reset)
+    #     .otherwise(None)
+    #     .alias("weight"),
+    #     pl.when(pl.col("in_index").is_null())
+    #     .then(1.0)
+    #     .otherwise(0.0)
+    #     .alias("in_coef_0"),
+    #     pl.when(pl.col("in_index").is_null())
+    #     .then(0.0)
+    #     .otherwise(1.0)
+    #     .alias("in_coef_1"),
+    #     pl.lit(threshold - LEVEL_MARGIN, pl.Float64).alias("rhs_coef_0"),
+    #     pl.lit(0.0, pl.Float64).alias("rhs_coef_1"),
+    # )
+
+    # return in_states.select(
+    #     pl.all()
+    #     .gather(pl.int_range(pl.len() - 1))
+    #     .over("f_index", mapping_strategy="explode")
+    # )
+
+
+# def optimize(
+#     neurons: pl.DataFrame,
+#     synapses: pl.DataFrame,
+#     spikes: pl.DataFrame,
+#     periods: pl.DataFrame,
+#     wmin: float = float("-inf"),
+#     wmax: float = float("inf"),
+#     n_iter: int = 1000,
+#     logger=None,
+# ) -> pl.DataFrame:
+#     """Optimize synaptic weights using template-based iterative constraint refinement.
+
+#     Performs iterative optimization of synaptic weights by alternating between weight optimization and constraint refinement.
+#     Uses linear programming with template-based constraints to ensure proper firing behavior.
+
+#     Args:
+#         neurons (pl.DataFrame): Neuron parameters with columns 'neuron', 'threshold', 'reset'.
+#         synapses (pl.DataFrame): Synaptic connections with columns 'source', 'target', 'delay', 'weight'.
+#         spikes (pl.DataFrame): Spike train data with columns 'index', 'period', 'neuron', 'time'.
+#         periods (pl.DataFrame): Period information with columns 'index', 'period'.
+#         wmin (float, optional): Minimum synaptic weight bound. Defaults to -inf.
+#         wmax (float, optional): Maximum synaptic weight bound. Defaults to inf.
+#         eps (float, optional): Epsilon parameter for before-firing constraints. Defaults to 0.2.
+#         zmax (float, optional): Maximum membrane potential in silent regions. Defaults to 0.0.
+#         dzmin (float, optional): Minimum derivative in active regions for sufficient rise. Defaults to 1.0.
+#         n_iter (int, optional): Maximum number of constraint generation iterations. Defaults to 1000.
+#         feas_tol (float, optional): Feasibility tolerance for constraint violations. Defaults to 1e-5.
+
+#     Returns:
+#         pl.DataFrame: Optimized synapses as a DataFrame with columns 'source', 'target', 'delay', 'weight'.
+#             If optimization fails for any neuron, returns synapses with 'weight' set to None.
+
+#     Raises:
+#         ValueError: If eps < 0, zmax > FIRING_THRESHOLD, dzmin < 0, or wmin >= wmax.
+
+#     Notes:
+#         The optimization alternates between:
+#         1. Minimizing L2 norm of weights subject to current constraints
+#         2. Adding new constraints for detected violations in silent/active regions
+#         Converges when no more constraint violations are found.
+#     """
+#     if logger is None:
+#         logger = setup_logging(
+#             __name__,
+#             console_level="INFO",
+#             file_level="DEBUG",
+#             file_path="optim-naive.log",
+#         )
+
+#     if wmin >= wmax:
+#         raise ValueError("wmin must be less than wmax.")
+
+#     if neurons.height != neurons.unique("neuron").height:
+#         raise ValueError("Neurons DataFrame contains duplicate neuron entries.")
+
+#     synapses_lst = []
+
+#     # for (neuron,), in_synapses in synapses.partition_by(
+#     #     "target", maintain_order=False, as_dict=True
+#     # ).items():
+#     for id in neurons["neuron"]:
+#         logger.debug(f"Optimizing neuron {id}...")
+
+#         # Extract neuron information
+#         neuron = neurons.filter(pl.col("neuron") == id)
+#         threshold = neuron.select("threshold").item()
+#         reset = neuron.select("reset").item()
+
+#         out_spikes = spikes.filter(pl.col("neuron") == id).with_columns(
+#             pl.int_range(pl.len(), dtype=pl.UInt32).alias("f_index")
+#         )
+#         in_synapses = synapses.filter(pl.col("target") == id).with_columns(
+#             pl.int_range(pl.len(), dtype=pl.UInt32).alias("in_index")
+#         )
+#         in_spikes = spikes.join(
+#             in_synapses, left_on="neuron", right_on="source"
+#         ).select(
+#             pl.col("index"),
+#             pl.col("in_index"),
+#             pl.col("time") + pl.col("delay"),
+#             pl.col("weight"),
+#         )
+
+#         # init_synapses(synapses.filter(pl.col("target") == id), spikes.select("neuron"))
+#         # out_spikes = init_out_spikes(spikes.filter(pl.col("neuron") == id))
+
+#         ## Initialize Gurobi model with variables, objective, and initial constraints (at firing times)
+#         model = gp.Model("model")
+#         model.setParam("OutputFlag", 0)  # Disable output
+
+#         # Setup variables to be optimized = the synaptic weights
+#         weights = model.addMVar(shape=in_synapses.height, lb=wmin, ub=wmax)
+#         logger.debug(f"Neuron {id}. Learnable weights initialized.")
+
+#         # Objective function - activity-agnostic
+#         model.setObjective(
+#             weights @ weights,
+#             sense=gp.GRB.MINIMIZE,
+#         )
+#         logger.debug(f"Neuron {id}. Objective function set.")
+
+#         ### TO CONTINUE HERE.-..
+
+#         # Compute states for linear constraints
+#         syn_states, rec_states, states = compute_states(
+#             out_spikes, in_spikes, threshold, reset, periods
+#         )
+
+#         # Firing time constraints
+#         lin_map = compute_linear_map(
+#             in_synapses.height,
+#             syn_states,
+#             rec_states,
+#             out_spikes.select("f_index", "time").with_row_index("t_index"),
+#         )
+#         model.addConstr(lin_map(weights) == threshold)
+#         lin_map = compute_linear_map(
+#             in_synapses.height,
+#             syn_states,
+#             rec_states,
+#             out_spikes.select("f_index", "time").with_row_index("t_index"),
+#             deriv=1,
+#         )
+#         model.addConstr(lin_map(weights) >= SLOPE_MARGIN)  # type: ignore
+#         logger.debug(f"Neuron {id}. Firing time constraints added.")
+
+#         for i in range(n_iter):
+#             # 1. Optimize weights
+#             model.optimize()
+
+#             if model.status != gp.GRB.OPTIMAL:
+#                 logger.error(
+#                     f"Neuron {id}. Optimization failed: {GUROBI_STATUS[model.status]}"
+#                 )
+#                 return synapses.with_columns(pl.lit(None, pl.Float64).alias("weight"))
+
+#             states = scan_with_new_weights(states, weights.X)  # type: ignore
+#             # logger.info(states.filter(pl.col("coef_0") > FIRING_THRESHOLD))
+
+#             # 2. Refine constraints
+#             max_violations = find_max_violations(states)
+
+#             if max_violations.height > 0:
+#                 logger.info(
+#                     f"Neuron {id}: iteration {i}. The objective is {model.getAttr('ObjVal')} for {model.getAttr('NumConstrs')} linear constraints; still {max_violations.height} violations to resolve."
+#                 )
+#                 max_violations = max_violations.with_row_index("t_index").with_columns(
+#                     pl.col("tmax").alias("time")
+#                 )
+#                 logger.debug(
+#                     f"\tNew support constraints at time(s): {max_violations.get_column('time').to_list()}."
+#                 )
+#                 lin_map = compute_linear_map(
+#                     in_synapses.height,
+#                     syn_states,
+#                     rec_states,
+#                     max_violations,
+#                 )
+#                 zmax = max_violations.get_column("bound").to_numpy()  # type: ignore
+#                 model.addConstr(lin_map(weights) <= zmax)  # type: ignore
+
+#             else:
+#                 logger.info(
+#                     f"Neuron {id}: iteration {i}. The objective is {model.getAttr('ObjVal')} for {model.getAttr('NumConstrs')} linear constraints. No more violations."
+#                 )
+#                 synapses_lst.append(
+#                     in_synapses.update(
+#                         pl.DataFrame({"weight": weights.X}).with_row_index("in_index"),
+#                         on="in_index",
+#                     ).select(
+#                         pl.lit(id).alias("source"),
+#                         pl.col("target"),
+#                         pl.col("delay"),
+#                         pl.col("weight"),
+#                     )
+#                 )
+#                 break
+
+#     return pl.concat(synapses_lst)
 
 
 def optimize(
-    synapses: pl.DataFrame,
-    spikes: pl.DataFrame,
+    syn_states: pl.DataFrame,
+    rec_states: pl.DataFrame,
+    out_spikes: pl.DataFrame,
+    threshold: float = FIRING_THRESHOLD,
+    # reset: float = REFRACTORY_RESET,
     wmin: float = float("-inf"),
     wmax: float = float("inf"),
+    dztol: float = 1e-6,
+    ztol: float = 1e-6,
     n_iter: int = 1000,
-) -> pl.DataFrame:
+    logger=None,
+    return_model: bool = False,
+    return_states: bool = False,
+) -> (
+    pl.DataFrame
+    | tuple[pl.DataFrame, gp.Model]
+    | tuple[pl.DataFrame, pl.DataFrame]
+    | tuple[pl.DataFrame, gp.Model, pl.DataFrame]
+):
     """Optimize synaptic weights using template-based iterative constraint refinement.
 
     Performs iterative optimization of synaptic weights by alternating between weight optimization and constraint refinement.
     Uses linear programming with template-based constraints to ensure proper firing behavior.
 
     Args:
-        synapses (pl.DataFrame): Synaptic connections with columns 'source', 'target', 'delay', 'weight'.
-        spikes (pl.DataFrame): Spike train data with columns 'index', 'period', 'neuron', 'time'.
+        out_spikes (pl.DataFrame): Output spike data with columns 'f_index', 'time'. Must be sorted by time within each neuron group.
+        in_spikes (pl.DataFrame): Input spike data with columns 'neuron', 'time', 'weight'. Must be sorted by time within each neuron group.
+        periods (pl.DataFrame): Period information with columns 'index', 'period'.
         wmin (float, optional): Minimum synaptic weight bound. Defaults to -inf.
         wmax (float, optional): Maximum synaptic weight bound. Defaults to inf.
-        eps (float, optional): Epsilon parameter for before-firing constraints. Defaults to 0.2.
-        zmax (float, optional): Maximum membrane potential in silent regions. Defaults to 0.0.
-        dzmin (float, optional): Minimum derivative in active regions for sufficient rise. Defaults to 1.0.
         n_iter (int, optional): Maximum number of constraint generation iterations. Defaults to 1000.
-        feas_tol (float, optional): Feasibility tolerance for constraint violations. Defaults to 1e-5.
+        logger (optional): Logger for logging messages. If None, a default logger is created.
 
     Returns:
-        pl.DataFrame: Optimized synapses as a DataFrame with columns 'source', 'target', 'delay', 'weight'.
-            If optimization fails for any neuron, returns synapses with 'weight' set to None.
+        pl.DataFrame: Optimized synapses as a DataFrame with columns 'in_index' and 'weight'. If optimization fails, returns DataFrame with 'weight' set to None.
 
     Raises:
         ValueError: If eps < 0, zmax > FIRING_THRESHOLD, dzmin < 0, or wmin >= wmax.
@@ -173,139 +318,168 @@ def optimize(
         2. Adding new constraints for detected violations in silent/active regions
         Converges when no more constraint violations are found.
     """
+    if logger is None:
+        logger = setup_logging(
+            __name__,
+            console_level="INFO",
+            file_level="DEBUG",
+            file_path="naive.log",
+        )
+
     if wmin >= wmax:
         raise ValueError("wmin must be less than wmax.")
 
-    synapses_lst = []
+    if dztol < 0:
+        raise ValueError("dztol must be non-negative.")
 
-    for (neuron,), in_synapses in synapses.partition_by(
-        "target", maintain_order=False, as_dict=True
-    ).items():
-        logger.debug(f"Optimizing neuron {neuron}...")
-        # Prepare synapses and output spikes for the current neuron
-        in_synapses = init_synapses(in_synapses, spikes.select("neuron"))
-        out_spikes = init_out_spikes(spikes.filter(pl.col("neuron") == neuron))
+    if ztol < 0:
+        raise ValueError("ztol must be non-negative.")
 
-        ## Initialize Gurobi model with variables, objective, and initial constraints (at firing times)
-        model = gp.Model("model")
-        model.setParam("OutputFlag", 0)  # Disable output
+    n_synapses = syn_states.select(pl.col("in_index")).max().item() + 1
 
-        # Setup variables to be optimized = the synaptic weights
-        weights = model.addMVar(shape=in_synapses.height, lb=wmin, ub=wmax)
-        logger.debug(f"Neuron {neuron}. Learnable weights initialized.")
+    # init_synapses(synapses.filter(pl.col("target") == id), spikes.select("neuron"))
+    # out_spikes = init_out_spikes(spikes.filter(pl.col("neuron") == id))
 
-        # Objective function - activity-agnostic
-        model.setObjective(
-            weights @ weights,
-            sense=gp.GRB.MINIMIZE,
-        )
-        logger.debug(f"Neuron {neuron}. Objective function set.")
+    ## Initialize Gurobi model with variables, objective, and initial constraints (at firing times)
+    model = gp.Model("model")
+    model.setParam("OutputFlag", 0)  # Disable output
 
-        # Compute states for linear constraints
-        syn_states, rec_states, states = compute_states(in_synapses, out_spikes, spikes)
+    # Setup variables to be optimized = the synaptic weights
+    weights = model.addMVar(shape=n_synapses, lb=wmin, ub=wmax)
+    logger.debug("Learnable weights initialized.")
 
-        # Firing time constraints
-        lin_map = compute_linear_map(
-            in_synapses.height,
+    # Objective function - activity-agnostic
+    model.setObjective(weights @ weights, sense=gp.GRB.MINIMIZE)
+    logger.debug("Objective function set.")
+
+    # Firing time constraints
+    if return_model:
+        for time in out_spikes.select("f_index", "time").iter_rows(named=True):
+            # Threshold crossing
+            lin_map = compute_1d_linear_map(
+                n_synapses,
+                syn_states,
+                rec_states,
+                time,
+            )
+            model.addConstr(
+                lin_map(weights) == threshold,
+                name=f"ft-{time['f_index']}-{time['time']}",
+            )
+            # With minimum slope
+            lin_map = compute_1d_linear_map(
+                n_synapses,
+                syn_states,
+                rec_states,
+                time,
+                deriv=1,
+            )
+            model.addConstr(
+                lin_map(weights) >= dztol,
+                name=f"dft-{time['f_index']}-{time['time']}",
+            )
+    else:
+        # Threshold crossing
+        lin_map = compute_nd_linear_map(
+            n_synapses,
             syn_states,
             rec_states,
             out_spikes.select("f_index", "time").with_row_index("t_index"),
         )
-        model.addConstr(lin_map(weights) == FIRING_THRESHOLD)
-
-        lin_map = compute_linear_map(
-            in_synapses.height,
+        model.addConstr(lin_map(weights) == threshold)
+        # With minimum slope
+        lin_map = compute_nd_linear_map(
+            n_synapses,
             syn_states,
             rec_states,
             out_spikes.select("f_index", "time").with_row_index("t_index"),
             deriv=1,
         )
-        model.addConstr(lin_map(weights) >= MIN_SLOPE)  # type: ignore
+        model.addConstr(lin_map(weights) >= dztol)
+    logger.debug("Firing time constraints added.")
 
-        logger.debug(f"Neuron {neuron}. Firing time constraints added.")
+    states = compute_template(syn_states, rec_states, threshold - ztol)
+    # init_states(in_spikes, threshold, reset)
 
-        for i in range(n_iter):
-            # 1. Optimize weights
-            model.optimize()
+    for i in range(n_iter):
+        # 1. Optimize weights
+        model.optimize()
 
-            if model.status != gp.GRB.OPTIMAL:
-                logger.error(
-                    f"Neuron {neuron}. Optimization failed: {GUROBI_STATUS[model.status]}"
-                )
-                return synapses.with_columns(pl.lit(None, pl.Float64).alias("weight"))
-
-            states = scan_with_new_weights(states, weights.X)  # type: ignore
-            # logger.info(states.filter(pl.col("coef_0") > FIRING_THRESHOLD))
-
-            # 2. Refine constraints
-            max_violations = find_max_violations(states)
-            logger.info(
-                f"Neuron {neuron}: iteration {i}. The objective is {model.getAttr('ObjVal')} for {model.getAttr('NumConstrs')} linear constraints; still {max_violations.height} violations to resolve."
+        if model.status != gp.GRB.OPTIMAL:
+            logger.error(
+                f"Iteration {i}. Optimization failed: {GUROBI_STATUS[model.status]}"
             )
+            break
 
-            if max_violations.height > 0:
-                max_violations = max_violations.with_row_index("t_index").with_columns(
-                    pl.col("tmax").alias("time")
-                )
-                lin_map = compute_linear_map(
-                    in_synapses.height,
-                    syn_states,
-                    rec_states,
-                    max_violations,
-                )
-                zmax = max_violations.get_column("bound").to_numpy()  # type: ignore
-                model.addConstr(lin_map(weights) <= zmax)  # type: ignore
+        states = scan_with_weights(states, weights.X)  # type: ignore
+        # logger.info(states.filter(pl.col("coef_0") > FIRING_THRESHOLD))
+
+        # 2. Refine constraints
+        max_violations = find_max_violations(states)
+
+        if max_violations.height > 0:
+            logger.info(
+                f"Iteration {i}. The objective is {model.getAttr('ObjVal')} for {model.getAttr('NumConstrs')} linear constraints; still {max_violations.height} violations to resolve."
+            )
+            max_violations = max_violations.rename({"tmax": "time"})
+
+            if return_model:
+                for violation in max_violations.iter_rows(named=True):
+                    lin_map = compute_1d_linear_map(
+                        n_synapses,
+                        syn_states,
+                        rec_states,
+                        violation,
+                    )
+                    model.addConstr(
+                        lin_map(weights) <= violation["bound"],
+                        name=f"mv-{violation["f_index"]}-{violation["time"]}-{violation["bound"]}",
+                    )
 
             else:
-                logger.info(
-                    f"Neuron {neuron}. Optimization successful (in {i} iterations)"
+                lin_map = compute_nd_linear_map(
+                    n_synapses,
+                    syn_states,
+                    rec_states,
+                    max_violations.with_row_index("t_index"),
                 )
-                synapses_lst.append(
-                    in_synapses.update(
-                        pl.DataFrame({"weight": weights.X}).with_row_index("in_index"),
-                        on="in_index",
-                    ).drop("in_index")
-                )
-                break
+                model.addConstr(lin_map(weights) <= max_violations.bound.to_numpy())  # type: ignore
 
-    return pl.concat(synapses_lst)
+            logger.debug("Maximum violation constraints added.")
 
-
-def scan_with_new_weights(states: pl.DataFrame, weights: np.ndarray) -> pl.DataFrame:
-    """Update state coefficients with new synaptic weights using cumulative scanning.
-
-    Recalculates the membrane potential coefficients (coef_0, coef_1) for all states after updating synaptic weights. Uses temporal scanning to accumulate the effects of synaptic inputs over time with exponential decay.
-
-    Args:
-        states (pl.DataFrame): Neuronal states with columns 'f_index', 'start', 'length', 'in_index', 'in_coef_0', 'in_coef_1', 'weight'. Must be sorted by start time within each f_index group
-        weights (np.ndarray): New synaptic weight values to apply.
-
-    Returns:
-        pl.DataFrame: Updated states with recalculated 'weight', 'coef_0', and 'coef_1' columns.
-
-    Notes:
-        - Uses exponential decay scanning for temporal dynamics
-        - Updates both constant (coef_0) and linear (coef_1) membrane potential terms
-    """
-    return (
-        states.update(
-            pl.DataFrame({"weight": weights}).with_row_index("in_index"),
-            on="in_index",
-        )
-        .with_columns(
-            rp.scan_coef_1(
-                pl.col("length").shift(), pl.col("in_coef_1") * pl.col("weight")
+        else:
+            logger.info(
+                f"Iteration {i}. The objective is {model.getAttr('ObjVal')} for {model.getAttr('NumConstrs')} linear constraints. No more violations."
             )
-            .over("f_index")
-            .alias("coef_1")
-        )
-        .with_columns(
-            rp.scan_coef_0(
-                pl.col("length").shift(),
-                pl.col("coef_1").shift(),
-                pl.col("in_coef_0") * pl.col("weight"),
+
+            synapses = pl.DataFrame(
+                data={
+                    "in_index": np.arange(n_synapses, dtype=np.uint32),
+                    "weight": weights.X,
+                },
+                schema={"in_index": pl.UInt32, "weight": pl.Float64},
             )
-            .over("f_index")
-            .alias("coef_0")
-        )
-    )
+
+            if return_model and return_states:
+                return synapses, model, states
+
+            if return_model:
+                return synapses, model
+
+            if return_states:
+                return synapses, states
+
+            return synapses
+
+    synapses = pl.DataFrame(schema={"in_index": pl.UInt32, "weight": pl.Float64})
+
+    if return_model and return_states:
+        return synapses, model, states
+
+    if return_model:
+        return synapses, model
+
+    if return_states:
+        return synapses, states
+
+    return synapses

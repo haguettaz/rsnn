@@ -1,7 +1,9 @@
 import logging
 
 
-def setup_logging(name: str, console_level: str, file_level: str) -> logging.Logger:
+def setup_logging(
+    name: str, console_level: str, file_level: str, file_path: str
+) -> logging.Logger:
     """
     Configure and return a logger with console and file handlers.
 
@@ -16,6 +18,8 @@ def setup_logging(name: str, console_level: str, file_level: str) -> logging.Log
         Log level for console output (e.g., "DEBUG", "INFO", "WARNING", "ERROR").
     file_level : str
         Log level for file output (e.g., "DEBUG", "INFO", "WARNING", "ERROR").
+    file_path : str
+        Path to the log file where logs will be saved.
 
     Returns
     -------
@@ -55,7 +59,7 @@ def setup_logging(name: str, console_level: str, file_level: str) -> logging.Log
         console_handler.setLevel(console_level_int)
         logger.addHandler(console_handler)
 
-        file_handler = logging.FileHandler("app.log", mode="a", encoding="utf-8")
+        file_handler = logging.FileHandler(file_path, mode="a", encoding="utf-8")
         file_handler.setFormatter(formatter)
         file_level_int = (
             file_level

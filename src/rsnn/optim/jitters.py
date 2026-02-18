@@ -3,14 +3,12 @@ import polars as pl
 import scipy.sparse as ss
 
 from rsnn import REFRACTORY_RESET
-from rsnn.log import setup_logging
 from rsnn.utils import modulo_with_offset
 
-# Set up logging
-logger = setup_logging(__name__, console_level="DEBUG", file_level="INFO")
 
-
-def compute_Phi(synapses: pl.DataFrame, spikes: pl.DataFrame) -> np.ndarray:
+def compute_Phi(
+    synapses: pl.DataFrame, spikes: pl.DataFrame, period: float
+) -> np.ndarray:
     """Compute the spike propagation matrix Phi for jitter analysis.
 
     Calculates the linear transformation matrix that describes how spike
@@ -19,7 +17,8 @@ def compute_Phi(synapses: pl.DataFrame, spikes: pl.DataFrame) -> np.ndarray:
 
     Args:
         synapses (pl.DataFrame): Synaptic connections with columns 'source', 'target', 'delay', 'weight'.
-        spikes (pl.DataFrame): Spike train data with columns 'period', 'neuron', 'time'.
+        spikes (pl.DataFrame): Spike train data with columns 'neuron', 'time'.
+        period (float): Period of the spike patterns.
     Returns:
         np.ndarray: Spike propagation matrix Phi with shape (n_spikes, n_spikes). Each row represents how perturbations of all spikes affect one specific spike time.
 
@@ -34,8 +33,8 @@ def compute_Phi(synapses: pl.DataFrame, spikes: pl.DataFrame) -> np.ndarray:
         pl.int_range(pl.len(), dtype=pl.UInt32).alias("f_index"),
         modulo_with_offset(
             pl.col("time").gather((pl.int_range(pl.len()) - 1) % pl.len()),
-            pl.col("period"),
-            pl.col("time") - pl.col("period"),
+            pl.lit(period),
+            pl.col("time") - pl.lit(period),
         )
         .over("neuron", order_by="time")
         .alias("time_prev"),
@@ -72,7 +71,7 @@ def compute_Phi(synapses: pl.DataFrame, spikes: pl.DataFrame) -> np.ndarray:
         pl.lit(None, pl.UInt32).alias("f_index_target"),
         modulo_with_offset(
             pl.col("time") + pl.col("delay"),
-            pl.col("period"),
+            pl.lit(period),
             pl.col("time_origin"),
         ).alias("f_time_in_target"),
         pl.lit(None, pl.Float64).alias("f_time_out_target"),
@@ -124,7 +123,7 @@ def compute_Phi(synapses: pl.DataFrame, spikes: pl.DataFrame) -> np.ndarray:
     return Phi
 
 
-def compute_lm_jitters_eigenvalues(synapses, spikes, k=3):
+def compute_lm_jitters_eigenvalues(synapses, spikes, period, k=3):
     """Compute dominant eigenvalues of the jitter propagation matrices using sparse methods.
 
     Calculates the k largest eigenvalues of the deflated spike propagation matrix for each spike pattern index.
@@ -133,8 +132,9 @@ def compute_lm_jitters_eigenvalues(synapses, spikes, k=3):
     Args:
         synapses (pl.DataFrame): Synaptic connections with columns 'source',
             'target', 'delay', 'weight'.
-        spikes (pl.DataFrame): Spike train data with columns 'index', 'neuron',
-            'time', 'period'.
+        spikes (pl.DataFrame): Spike train data with columns 'neuron',
+            'time'.
+        period (float): Period of the spike patterns.
         k (int, optional): Number of dominant eigenvalues to compute. Defaults to 3.
 
     Returns:
@@ -152,17 +152,11 @@ def compute_lm_jitters_eigenvalues(synapses, spikes, k=3):
 
     ## Extend spikes with additional information
 
-    eigenvalues = {}
-    for (i,), spikes_i in spikes.partition_by("index", as_dict=True).items():
-        Phi = compute_Phi(synapses, spikes_i)
-        eigenvalues[i] = ss.linalg.eigs(
-            Phi - 1 / Phi.shape[0], k=k, return_eigenvectors=False
-        )
-
-    return eigenvalues
+    Phi = compute_Phi(synapses, spikes, period)
+    return ss.linalg.eigs(Phi - 1 / Phi.shape[0], k=k, return_eigenvectors=False)
 
 
-def compute_jitters_eigenvalues(synapses, spikes):
+def compute_jitters_eigenvalues(synapses, spikes, period):
     """Compute all eigenvalues of the jitter propagation matrix.
 
     Calculates the complete eigenspectrum of the deflated spike propagation matrix for each spike pattern index.
@@ -188,9 +182,5 @@ def compute_jitters_eigenvalues(synapses, spikes):
     # Synapses is a dataframe with columns: source, target, delay, weight
     # States is a dataframe with columns: f_index_source, f_index_target, f_time_in_target (=f_time_out_source + delay), f_time_out_target, weight_0, weight_1 (index, period, f_time_out_source, and delay are optional)
 
-    eigenvalues = {}
-    for (i,), spikes_i in spikes.partition_by("index", as_dict=True).items():
-        Phi = compute_Phi(synapses, spikes_i)
-        eigenvalues[i] = np.linalg.eigvals(Phi - 1 / Phi.shape[0])
-
-    return eigenvalues
+    Phi = compute_Phi(synapses, spikes, period)
+    return np.linalg.eigvals(Phi - 1 / Phi.shape[0])

@@ -1,13 +1,12 @@
 import numpy as np
 import polars as pl
-from scipy.sparse import csr_array
-from scipy.sparse.csgraph import floyd_warshall
 
 import rsnn_plugin as rp
 from rsnn import FIRING_THRESHOLD, REFRACTORY_RESET
 from rsnn.log import setup_logging
 
-logger = setup_logging(__name__, console_level="INFO", file_level="DEBUG")
+# from rsnn.sim.update import update_weights
+from rsnn.sim.utils import init_min_delays, init_states, init_syn_states
 
 
 def filter_new_spikes(
@@ -116,100 +115,168 @@ def filter_states(
     )
 
 
-def init_states(spikes: pl.DataFrame, synapses: pl.DataFrame) -> pl.DataFrame:
-    """Initialize neuronal states from spikes and synaptic connections.
+# def run_wiener_threshold(
+#     neurons,
+#     spikes,
+#     synapses,
+#     start,
+#     end,
+#     refractory_reset=REFRACTORY_RESET,
+#     noise_std=0.0,
+#     states=None,
+#     min_delays=None,
+#     rng=None,
+#     logger=None,
+# ):
+#     """Run discrete event simulation of spiking neural network.
 
-    Creates initial state representation for the simulation by computing synaptic and refractory states from existing spikes. Filters out states that start before the last spike of each neuron.
+#     Executes a discrete event simulation of the spiking neural network from
+#     start to end time. Uses event-driven simulation with causal filtering
+#     to maintain temporal consistency and efficiency.
 
-    Args:
-        spikes (pl.DataFrame): Spike events with columns 'neuron', 'time'. Must be sorted by time within each neuron group.
-        synapses (pl.DataFrame): Synaptic connections with columns 'source', 'target', 'delay', 'weight'.
+#     Args:
+#         neurons (pl.DataFrame): Neuron properties with columns 'neuron', 'f_thresh'.
+#         spikes (pl.DataFrame): Initial spike events with columns 'neuron', 'time'.
+#         synapses (pl.DataFrame): Synaptic connections with columns 'source',
+#             'target', 'delay', 'weight'.
+#         start (float): Simulation start time.
+#         end (float): Simulation end time.
+#         std_thresh (float, optional): Standard deviation for threshold
+#             noise. Defaults to 0.0.
+#         rng (np.random.Generator, optional): Random number generator for
+#             threshold noise. Defaults to None.
 
-    Returns:
-        pl.DataFrame: Initial states with columns 'neuron', 'start',
-            'in_coef_0', 'in_coef_1'.
+#     Returns:
+#         tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]: A tuple containing:
+#             - neurons: Updated neuron states with final thresholds
+#             - spikes: Complete spike train including generated spikes
+#             - states: Final neuronal states at simulation end
 
-    Warning:
-        Spikes must be sorted by time over the neurons for correct operation.
+#     Notes:
+#         Uses discrete event simulation with:
+#         - Causal filtering based on minimum propagation delays
+#         - Dynamic threshold updates with optional noise
+#         - Event-driven state updates for efficiency
+#         - Refractory and synaptic state management
+#     """
+#     if rng is None:
+#         rng = np.random.default_rng()
 
-    Notes:
-        Combines synaptic states (from incoming connections) and refractory
-        states (from last spikes) to create the initial condition for simulation.
-    """
-    # Compute last spikes per neuron
-    last_spikes = spikes.group_by("neuron").agg(pl.last("time"))
+#     if logger is None:
+#         logger = setup_logging(
+#             __name__,
+#             console_level="INFO",
+#             file_level="INFO",
+#             file_path="run-wiener-threshold.log",
+#         )
 
-    # Synaptic states
-    syn_states = synapses.join(spikes, left_on="source", right_on="neuron").select(
-        pl.col("target").alias("neuron"),
-        (pl.col("time") + pl.col("delay")).alias("start"),
-        pl.lit(0.0, pl.Float64).alias("in_coef_0"),
-        pl.col("weight").alias("in_coef_1"),
-    )
+#     spikes = spikes.sort("time")
 
-    # Refractory states
-    rec_states = last_spikes.select(
-        pl.col("neuron"),
-        pl.col("time").alias("start"),
-        pl.lit(REFRACTORY_RESET, pl.Float64).alias("in_coef_0"),
-        pl.lit(0.0, pl.Float64).alias("in_coef_1"),
-    )
+#     if "index" not in synapses.columns:
+#         synapses = synapses.with_row_index()
 
-    return (
-        syn_states.extend(rec_states)
-        .join(last_spikes, on="neuron", how="left")
-        .remove(pl.col("start") < pl.col("time"))
-        .drop("time")
-    )
+#     if states is None:
+#         states = init_states(spikes, synapses)
+#         logger.info("Neuronal states initialized.")
+
+#     if min_delays is None:
+#         min_delays = init_min_delays(synapses)
+#         logger.info("Minimum delays initialized.")
+
+#     # Main simulation loop
+#     logger.info(f"Simulation from {start} to {end} in progress...")
+#     time = start
+#     while time < end:
+#         # Sort states according to their starting time
+#         states = states.sort("start")
+
+#         # New spikes
+#         new_spikes = (
+#             states.join(neurons, on="neuron")
+#             .group_by("neuron")
+#             .agg(
+#                 time=rp.first_ftime(
+#                     pl.col("start"),
+#                     pl.col("start").diff().shift(-1),  # length
+#                     pl.col("start").diff(),  # prev_length
+#                     pl.col("in_coef_0"),
+#                     pl.col("in_coef_1"),
+#                     pl.col("f_thresh"),
+#                 )
+#             )
+#             .drop_nulls()
+#         )
+#         new_spikes = filter_new_spikes(new_spikes, min_delays)
+
+#         # Simulation time
+#         time = new_spikes.select("time").min().item() or end
+#         logger.debug(f"Simulation time: {time}")
+
+#         # Append new spikes
+#         spikes = spikes.vstack(new_spikes)
+
+#         # Update firing threshold with Wiener noise
+#         tmp = rng.normal(0, 1.0, size=new_spikes.height)
+#         neurons = neurons.update(
+#             new_spikes.join(neurons, on="neuron", how="left")
+#             .with_columns(
+#                 pl.lit(tmp).alias("noise"),
+#                 (pl.col("time") - pl.col("prev_time")).alias("delta"),
+#             )
+#             .with_columns(
+#                 (
+#                     pl.col("f_thresh")
+#                     + noise_std * pl.col("noise") * pl.col("delta").sqrt()
+#                 ).alias("f_thresh"),
+#             )
+#             .select(
+#                 pl.col("neuron"), pl.col("f_thresh"), pl.col("time").alias("prev_time")
+#             ),
+#             on="neuron",
+#         )
+
+#         # Recovery states
+#         rec_states = new_spikes.select(
+#             pl.col("neuron"),
+#             pl.col("time").alias("start"),
+#             pl.lit(refractory_reset, pl.Float64).alias("in_coef_0"),
+#             pl.lit(0.0, pl.Float64).alias("in_coef_1"),
+#         )
+
+#         # Synaptic states
+#         syn_states = synapses.join(
+#             new_spikes, left_on="source", right_on="neuron"
+#         ).select(
+#             pl.col("target").alias("neuron"),
+#             (pl.col("time") + pl.col("delay")).alias("start"),
+#             pl.lit(0.0, pl.Float64).alias("in_coef_0"),
+#             pl.col("weight").alias("in_coef_1"),
+#         )
+
+#         # Merge and cleanse states
+#         states = (
+#             states.extend(rec_states)
+#             .extend(syn_states)
+#             .join(new_spikes, on="neuron", how="left")
+#             .remove(pl.col("start") < pl.col("time"))
+#             .drop("time")
+#         )
+
+#     logger.info("Simulation completed!")
+#     return neurons, spikes, states
 
 
-def init_min_delays(synapses, n_neurons):
-    """Compute shortest path delays between all pairs of neurons.
-
-    Calculates the minimum propagation delays between all neuron pairs
-    using the Floyd-Warshall algorithm on the synaptic connectivity graph.
-    Used for enforcing causal constraints during simulation.
-
-    Args:
-        synapses (pl.DataFrame): Synaptic connections with columns 'source',
-            'target', 'delay'.
-        n_neurons (int): Total number of neurons in the network.
-
-    Returns:
-        pl.DataFrame: Minimum delays between all connected neuron pairs
-            with columns 'source', 'target', 'delay'.
-
-    Notes:
-        Uses sparse matrix representation and Floyd-Warshall algorithm for
-        efficient all-pairs shortest path computation. Only finite delays
-        (reachable pairs) are returned in the result.
-    """
-    # Initialize fast synapses by grouping and aggregating the minimum delay
-    min_delays = synapses.group_by(["source", "target"]).agg(
-        pl.min("delay").alias("delay")
-    )
-
-    # Convert to a sparse matrix for Floyd-Warshall algorithm
-    row_ind = min_delays.get_column("source").to_numpy()
-    col_ind = min_delays.get_column("target").to_numpy()
-    data = min_delays.get_column("delay").to_numpy()
-    graph = csr_array((data, (row_ind, col_ind)), shape=(n_neurons, n_neurons))
-    graph = floyd_warshall(graph, directed=True, overwrite=True)
-
-    # Convert back to DataFrame
-    min_delays = pl.DataFrame(
-        {
-            "source": np.repeat(np.arange(n_neurons), n_neurons),
-            "target": np.tile(np.arange(n_neurons), n_neurons),
-            "delay": graph.flatten(),
-        }
-    )
-    min_delays = min_delays.filter(pl.col("delay").is_finite())
-
-    return min_delays
-
-
-def run(neurons, spikes, synapses, start, end, std_threshold=0.0, rng=None):
+def run(
+    neurons,
+    spikes,
+    synapses,
+    start,
+    end,
+    states=None,
+    min_delays=None,
+    rng=None,
+    logger=None,
+):
     """Run discrete event simulation of spiking neural network.
 
     Executes a discrete event simulation of the spiking neural network from
@@ -217,14 +284,11 @@ def run(neurons, spikes, synapses, start, end, std_threshold=0.0, rng=None):
     to maintain temporal consistency and efficiency.
 
     Args:
-        neurons (pl.DataFrame): Neuron properties with columns 'neuron', 'f_thresh'.
+        neurons (pl.DataFrame): Neuron properties with columns 'neuron', 'threshold'.
         spikes (pl.DataFrame): Initial spike events with columns 'neuron', 'time'.
-        synapses (pl.DataFrame): Synaptic connections with columns 'source',
-            'target', 'delay', 'weight'.
+        synapses (pl.DataFrame): Synaptic connections with columns 'source', 'target', 'delay', 'weight'.
         start (float): Simulation start time.
         end (float): Simulation end time.
-        std_threshold (float, optional): Standard deviation for threshold
-            noise. Defaults to 0.0.
         rng (np.random.Generator, optional): Random number generator for
             threshold noise. Defaults to None.
 
@@ -244,12 +308,33 @@ def run(neurons, spikes, synapses, start, end, std_threshold=0.0, rng=None):
     if rng is None:
         rng = np.random.default_rng()
 
-    spikes = spikes.sort("time")
-    states = init_states(spikes, synapses)
-    logger.info("States initialized.")
+    if logger is None:
+        logger = setup_logging(
+            __name__,
+            console_level="INFO",
+            file_level="INFO",
+            file_path="run-white-threshold.log",
+        )
 
-    min_delays = init_min_delays(synapses, neurons.select(pl.max("neuron")).item() + 1)
-    logger.info("Minimum delays initialized.")
+    spikes = spikes.sort("time")
+
+    # if "index" not in synapses.columns:
+    #     synapses = synapses.with_row_index()
+
+    if states is None:
+        states = init_states(
+            spikes,
+            synapses.join(neurons, left_on="target", right_on="neuron", how="semi"),
+        )
+        logger.info("Neuronal states initialized.")
+
+    if min_delays is None:
+        min_delays = init_min_delays(
+            synapses.join(
+                neurons, left_on="source", right_on="neuron", how="semi"
+            ).join(neurons, left_on="target", right_on="neuron", how="semi")
+        )
+        logger.info("Minimum delays initialized.")
 
     # Main simulation loop
     logger.info(f"Simulation from {start} to {end} in progress...")
@@ -269,12 +354,13 @@ def run(neurons, spikes, synapses, start, end, std_threshold=0.0, rng=None):
                     pl.col("start").diff(),  # prev_length
                     pl.col("in_coef_0"),
                     pl.col("in_coef_1"),
-                    pl.col("f_thresh"),
+                    pl.col("threshold"),
                 )
             )
             .drop_nulls()
         )
         new_spikes = filter_new_spikes(new_spikes, min_delays)
+        f_neurons = new_spikes.join(neurons, on="neuron")
 
         # Simulation time
         time = new_spikes.select("time").min().item() or end
@@ -283,19 +369,8 @@ def run(neurons, spikes, synapses, start, end, std_threshold=0.0, rng=None):
         # Append new spikes
         spikes = spikes.vstack(new_spikes)
 
-        # Firing threshold
-        neurons = neurons.update(
-            new_spikes.select(
-                pl.col("neuron"),
-                pl.lit(
-                    rng.normal(FIRING_THRESHOLD, std_threshold, size=new_spikes.height)
-                ).alias("f_thresh"),
-            ),
-            on="neuron",
-        )
-
         # Recovery states
-        rec_states = new_spikes.select(
+        rec_states = f_neurons.select(
             pl.col("neuron"),
             pl.col("time").alias("start"),
             pl.lit(REFRACTORY_RESET, pl.Float64).alias("in_coef_0"),
@@ -323,3 +398,469 @@ def run(neurons, spikes, synapses, start, end, std_threshold=0.0, rng=None):
 
     logger.info("Simulation completed!")
     return neurons, spikes, states
+
+
+def run_white_threshold(
+    neurons,
+    spikes,
+    synapses,
+    start,
+    end,
+    std_thresh=1e-3,
+    states=None,
+    min_delays=None,
+    rng=None,
+    logger=None,
+):
+    """Run discrete event simulation of spiking neural network.
+
+    Executes a discrete event simulation of the spiking neural network from
+    start to end time. Uses event-driven simulation with causal filtering
+    to maintain temporal consistency and efficiency.
+
+    Args:
+        neurons (pl.DataFrame): Neuron properties with columns 'neuron', 'threshold'.
+        spikes (pl.DataFrame): Initial spike events with columns 'neuron', 'time'.
+        synapses (pl.DataFrame): Synaptic connections with columns 'source',
+            'target', 'delay', 'weight'.
+        start (float): Simulation start time.
+        end (float): Simulation end time.
+        rng (np.random.Generator, optional): Random number generator for
+            threshold noise. Defaults to None.
+
+    Returns:
+        tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]: A tuple containing:
+            - neurons: Updated neuron states with final thresholds
+            - spikes: Complete spike train including generated spikes
+            - states: Final neuronal states at simulation end
+
+    Notes:
+        Uses discrete event simulation with:
+        - Causal filtering based on minimum propagation delays
+        - Dynamic threshold updates with optional noise
+        - Event-driven state updates for efficiency
+        - Refractory and synaptic state management
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    if logger is None:
+        logger = setup_logging(
+            __name__,
+            console_level="INFO",
+            file_level="INFO",
+            file_path="run-white-threshold.log",
+        )
+
+    spikes = spikes.sort("time")
+
+    # if "index" not in synapses.columns:
+    #     synapses = synapses.with_row_index()
+
+    if states is None:
+        states = init_states(
+            spikes,
+            synapses.join(neurons, left_on="target", right_on="neuron", how="semi"),
+        )
+        logger.info("Neuronal states initialized.")
+
+    if min_delays is None:
+        # use only autonomous neurons for the matrix of propagation delays
+        min_delays = init_min_delays(
+            synapses.join(
+                neurons, left_on="source", right_on="neuron", how="semi"
+            ).join(neurons, left_on="target", right_on="neuron", how="semi")
+        )
+        logger.info("Minimum delays initialized.")
+
+    # Main simulation loop
+    logger.info(f"Simulation from {start} to {end} in progress...")
+    time = start
+    while time < end:
+        # Sort states according to their starting time
+        states = states.sort("start")
+
+        # New spikes
+        new_spikes = (
+            states.join(neurons, on="neuron")
+            .group_by("neuron")
+            .agg(
+                time=rp.first_ftime(
+                    pl.col("start"),
+                    pl.col("start").diff().shift(-1),  # length
+                    pl.col("start").diff(),  # prev_length
+                    pl.col("in_coef_0"),
+                    pl.col("in_coef_1"),
+                    pl.col("threshold"),
+                )
+            )
+            .drop_nulls()
+        )
+        new_spikes = filter_new_spikes(new_spikes, min_delays)
+        f_neurons = new_spikes.join(neurons, on="neuron")
+
+        # Simulation time
+        time = new_spikes.select("time").min().item() or end
+        logger.debug(f"Simulation time: {time}")
+
+        # Append new spikes
+        spikes = spikes.vstack(new_spikes)
+
+        # Update firing threshold with white noise
+        neurons = neurons.update(
+            f_neurons.with_columns(
+                pl.lit(
+                    rng.normal(FIRING_THRESHOLD, std_thresh, size=f_neurons.height)
+                ).alias("threshold")
+            ).select(
+                pl.col("neuron"),
+                pl.col("threshold"),
+            ),
+            on="neuron",
+        )
+
+        # Recovery states
+        rec_states = f_neurons.select(
+            pl.col("neuron"),
+            pl.col("time").alias("start"),
+            pl.lit(REFRACTORY_RESET, pl.Float64).alias("in_coef_0"),
+            pl.lit(0.0, pl.Float64).alias("in_coef_1"),
+        )
+
+        # Synaptic states
+        syn_states = synapses.join(
+            new_spikes, left_on="source", right_on="neuron"
+        ).select(
+            pl.col("target").alias("neuron"),
+            (pl.col("time") + pl.col("delay")).alias("start"),
+            pl.lit(0.0, pl.Float64).alias("in_coef_0"),
+            pl.col("weight").alias("in_coef_1"),
+        )
+
+        # Merge and cleanse states
+        states = (
+            states.extend(rec_states)
+            .extend(syn_states)
+            .join(new_spikes, on="neuron", how="left")
+            .remove(pl.col("start") < pl.col("time"))
+            .drop("time")
+        )
+
+    logger.info("Simulation completed!")
+    return neurons, spikes, states
+
+
+# def run(
+#     neurons,
+#     spikes,
+#     synapses,
+#     start,
+#     end,
+#     states=None,
+#     min_delays=None,
+#     rng=None,
+#     logger=None,
+# ):
+#     """Run discrete event simulation of spiking neural network without noise.
+
+#     Executes a discrete event simulation of the spiking neural network from
+#     start to end time. Uses event-driven simulation with causal filtering
+#     to maintain temporal consistency and efficiency.
+
+#     Args:
+#         neurons (pl.DataFrame): Neuron properties with columns 'neuron', 'threshold'.
+#         spikes (pl.DataFrame): Initial spike events with columns 'neuron', 'time'.
+#         synapses (pl.DataFrame): Synaptic connections with columns 'source',
+#             'target', 'delay', 'weight'.
+#         start (float): Simulation start time.
+#         end (float): Simulation end time.
+#         rng (np.random.Generator, optional): Random number generator for
+#             threshold noise. Defaults to None.
+
+#     Returns:
+#         tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]: A tuple containing:
+#             - neurons: Updated neuron states with final thresholds
+#             - spikes: Complete spike train including generated spikes
+#             - states: Final neuronal states at simulation end
+
+#     Notes:
+#         Uses discrete event simulation with:
+#         - Causal filtering based on minimum propagation delays
+#         - Dynamic threshold updates with optional noise
+#         - Event-driven state updates for efficiency
+#         - Refractory and synaptic state management
+#     """
+#     if rng is None:
+#         rng = np.random.default_rng()
+
+#     if logger is None:
+#         logger = setup_logging(
+#             __name__,
+#             console_level="INFO",
+#             file_level="INFO",
+#             file_path="run-white-threshold.log",
+#         )
+
+#     if spikes is None:
+#         spikes = pl.DataFrame(
+#             schema={"neuron": pl.UInt32, "time": pl.Float64}
+#         )  # Empty spikes
+#     spikes = spikes.sort("time")
+
+#     if synapses is None:
+#         synapses = pl.DataFrame(
+#             schema={
+#                 "source": pl.UInt32,
+#                 "target": pl.UInt32,
+#                 "delay": pl.Float64,
+#                 "weight": pl.Float64,
+#             }
+#         )  # Empty synapses
+
+#     if states is None:
+#         states = init_states(spikes, synapses)
+#         logger.info("Neuronal states initialized.")
+
+#     if min_delays is None:
+#         min_delays = init_min_delays(synapses)
+#         logger.info("Minimum delays initialized.")
+
+#     # Main simulation loop
+#     logger.info(f"Simulation from {start} to {end} in progress...")
+#     time = start
+#     while time < end:
+#         # Sort states according to their starting time
+#         states = states.sort("start")
+
+#         # New spikes
+#         new_spikes = (
+#             states.join(neurons, on="neuron")
+#             .group_by("neuron")
+#             .agg(
+#                 time=rp.first_ftime(
+#                     pl.col("start"),
+#                     pl.col("start").diff().shift(-1),  # length
+#                     pl.col("start").diff(),  # prev_length
+#                     pl.col("in_coef_0"),
+#                     pl.col("in_coef_1"),
+#                     pl.col("threshold"),
+#                 )
+#             )
+#             .drop_nulls()
+#         )
+#         new_spikes = filter_new_spikes(new_spikes, min_delays)
+#         f_neurons = new_spikes.join(neurons, on="neuron")
+
+#         # Simulation time
+#         time = new_spikes.select("time").min().item() or end
+#         logger.debug(f"Simulation time: {time}")
+
+#         # Append new spikes
+#         spikes = spikes.vstack(new_spikes)
+
+#         # Recovery states
+#         rec_states = f_neurons.select(
+#             pl.col("neuron"),
+#             pl.col("time").alias("start"),
+#             pl.col("reset").alias("in_coef_0"),
+#             pl.lit(0.0, pl.Float64).alias("in_coef_1"),
+#         )
+
+#         # Synaptic states
+#         syn_states = synapses.join(
+#             new_spikes, left_on="source", right_on="neuron"
+#         ).select(
+#             pl.col("target").alias("neuron"),
+#             (pl.col("time") + pl.col("delay")).alias("start"),
+#             pl.lit(0.0, pl.Float64).alias("in_coef_0"),
+#             pl.col("weight").alias("in_coef_1"),
+#         )
+
+#         # Merge and cleanse states
+#         states = (
+#             states.extend(rec_states)
+#             .extend(syn_states)
+#             .join(new_spikes, on="neuron", how="left")
+#             .remove(pl.col("start") < pl.col("time"))
+#             .drop("time")
+#         )
+
+#     logger.info("Simulation completed!")
+#     return neurons, spikes, states
+
+
+# def run_adaptive_weights(
+#     neurons,
+#     spikes,
+#     synapses,
+#     start,
+#     end,
+#     alpha=1e-3,
+#     l2_reg=0.0,
+#     full=False,
+#     first_order=True,
+#     last_only=True,
+#     states=None,
+#     syn_states=None,
+#     min_delays=None,
+#     rng=None,
+#     logger=None,
+# ):
+#     """Run discrete event simulation of spiking neural network.
+
+#     Executes a discrete event simulation of the spiking neural network from
+#     start to end time. Uses event-driven simulation with causal filtering
+#     to maintain temporal consistency and efficiency.
+
+#     Args:
+#         neurons (pl.DataFrame): Neuron properties with columns 'neuron', 'f_thresh'.
+#         spikes (pl.DataFrame): Initial spike events with columns 'neuron', 'time'.
+#         synapses (pl.DataFrame): Synaptic connections with columns 'source',
+#             'target', 'delay', 'weight'.
+#         start (float): Simulation start time.
+#         end (float): Simulation end time.
+#         std_thresh (float, optional): Standard deviation for threshold
+#             noise. Defaults to 0.0.
+#         rng (np.random.Generator, optional): Random number generator for
+#             threshold noise. Defaults to None.
+
+#     Returns:
+#         tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]: A tuple containing:
+#             - neurons: Updated neuron states with final thresholds
+#             - spikes: Complete spike train including generated spikes
+#             - states: Final neuronal states at simulation end
+
+#     Notes:
+#         Uses discrete event simulation with:
+#         - Causal filtering based on minimum propagation delays
+#         - Dynamic threshold updates with optional noise
+#         - Event-driven state updates for efficiency
+#         - Refractory and synaptic state management
+#     """
+#     if rng is None:
+#         rng = np.random.default_rng()
+
+#     if logger is None:
+#         logger = setup_logging(
+#             __name__,
+#             console_level="INFO",
+#             file_level="INFO",
+#             file_path="run-white-threshold.log",
+#         )
+
+#     spikes = spikes.sort("time")
+
+#     if "index" not in synapses.columns:
+#         synapses = synapses.with_row_index()
+
+#     if syn_states is None:
+#         syn_states = init_syn_states(spikes, synapses)
+#         logger.info("Synaptic states initialized.")
+
+#     if states is None:
+#         states = init_states(spikes, synapses)
+#         logger.info("Neuronal states initialized.")
+
+#     if min_delays is None:
+#         min_delays = init_min_delays(synapses)
+#         logger.info("Minimum delays initialized.")
+
+#     # Main simulation loop
+#     logger.info(f"Simulation from {start} to {end} in progress...")
+#     time = start
+#     while time < end:
+#         # Sort states according to their starting time
+#         syn_states = syn_states.sort("start")
+#         states = states.sort("start")
+
+#         # New spikes
+#         new_spikes = (
+#             states.join(neurons, on="neuron")
+#             .group_by("neuron")
+#             .agg(
+#                 time=rp.first_ftime(
+#                     pl.col("start"),
+#                     pl.col("start").diff().shift(-1),  # length
+#                     pl.col("start").diff(),  # prev_length
+#                     pl.col("in_coef_0"),
+#                     pl.col("in_coef_1"),
+#                     pl.col("f_thresh"),
+#                 )
+#             )
+#             .drop_nulls()
+#         )
+#         new_spikes = filter_new_spikes(new_spikes, min_delays)
+
+#         # Simulation time
+#         time = new_spikes.select("time").min().item() or end
+#         logger.debug(f"Simulation time: {time}")
+
+#         # Append new spikes
+#         spikes = spikes.vstack(new_spikes)
+
+#         # Update synaptic weights of spiking neurons
+#         synapses = update_weights(
+#             new_spikes,
+#             synapses,
+#             syn_states,
+#             alpha,
+#             l2_reg,
+#             full,
+#             first_order,
+#             last_only,
+#         )
+#         logger.debug(
+#             f"New synaptic weights: {synapses.join(new_spikes, left_on='target', right_on='neuron')}"
+#         )
+
+#         # New synaptic states
+#         new_syn_states = synapses.join(
+#             new_spikes, left_on="source", right_on="neuron"
+#         ).select(
+#             pl.col("target").alias("neuron"),
+#             pl.col("in_index"),
+#             (pl.col("time") + pl.col("delay")).alias("start"),
+#             pl.col("weight"),
+#             # pl.lit(0.0, pl.Float64).alias("in_coef_0"),
+#         )
+
+#         # Merge and cleanse synaptic states
+#         syn_states = (
+#             syn_states.extend(
+#                 new_syn_states.select(
+#                     pl.col("neuron"),
+#                     pl.col("in_index"),
+#                     pl.col("start"),
+#                     # pl.col("weight"),
+#                 )
+#             )
+#             .join(new_spikes, on="neuron", how="left")
+#             .remove(pl.col("start") < pl.col("time"))
+#             .drop("time")
+#         )
+
+#         # Merge and cleanse states
+#         states = (
+#             states.extend(
+#                 new_spikes.select(
+#                     pl.col("neuron"),
+#                     pl.col("time").alias("start"),
+#                     pl.lit(REFRACTORY_RESET, pl.Float64).alias("in_coef_0"),
+#                     pl.lit(0.0, pl.Float64).alias("in_coef_1"),
+#                 )  # recovery states
+#             )
+#             .extend(
+#                 new_syn_states.select(
+#                     pl.col("neuron"),
+#                     pl.col("start"),
+#                     pl.lit(0.0, pl.Float64).alias("in_coef_0"),
+#                     pl.col("weight").alias("in_coef_1"),
+#                 )  # synaptic states
+#             )
+#             .join(new_spikes, on="neuron", how="left")
+#             .remove(pl.col("start") < pl.col("time"))
+#             .drop("time")
+#         )
+
+#     logger.info("Simulation completed!")
+#     return neurons, spikes, synapses, states, syn_states

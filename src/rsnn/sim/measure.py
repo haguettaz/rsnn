@@ -3,9 +3,6 @@ import polars as pl
 
 import rsnn_plugin as rp
 from rsnn import REFRACTORY_PERIOD
-from rsnn.log import setup_logging
-
-logger = setup_logging(__name__, console_level="INFO", file_level="INFO")
 
 
 def compute_upper_bounds(spikes_ref, spikes, n_neurons):
@@ -284,18 +281,23 @@ def compute_upper_bounds(spikes_ref, spikes, n_neurons):
 # return precisions, recalls
 
 
-def compute_scores(spikes_ref, spikes, shifts, n_neurons, which=None):
+def compute_scores(
+    true_spikes: pl.DataFrame,
+    spikes: pl.DataFrame,
+    n_neurons: int,
+    shift: float,
+    period: float,
+):
     """Compute similarity measures between the provided spike train and the periodic reference, across different uniform time shifts.
 
     Uses optimal one-to-one assignment with nearest-neighbor matching and tolerance for comparing spike times.
 
     Args:
-        spikes_ref (pl.DataFrame): Reference periodic spike patterns with columns
-            'neuron', 'time', 'period'.
-        spikes (pl.DataFrame): Generated spike trains with columns 'neuron', 'time'.
-        shifts (pl.DataFrame): Temporal shift values with column 'shift' for alignment testing.
+        true_spikes (pl.DataFrame): Reference periodic spike patterns with columns 'neuron', 'time'.
+        spikes (pl.DataFrame): Actual spike trains with columns 'neuron', 'time'.
         n_neurons (int): Total number of neurons in the network.
-        which (str, optional): Which score to return, 'best' or 'all'.
+        shift (float): Temporal shift to apply to the spike train for alignment with the reference.
+        period (float): Period of the reference spike patterns.
 
     Returns:
         tuple[pl.DataFrame, pl.DataFrame]: A tuple containing:
@@ -307,11 +309,11 @@ def compute_scores(spikes_ref, spikes, shifts, n_neurons, which=None):
         - Precision measures how many generated spikes match reference spikes
         - Recall measures how many reference spikes are matched by generated spikes
     """
-    if which is None:
-        which = "best"
+    # if which is None:
+    #     which = "best"
 
-    if which not in {"best", "all"}:
-        raise ValueError("which must be 'best' or 'all'")
+    # if which not in {"best", "all"}:
+    #     raise ValueError("which must be 'best' or 'all'")
 
     neurons = pl.DataFrame({"neuron": np.arange(n_neurons, dtype=np.uint32)})
 
@@ -322,7 +324,7 @@ def compute_scores(spikes_ref, spikes, shifts, n_neurons, which=None):
             on="neuron",
             how="left",
         ).join(
-            spikes_ref.group_by("neuron").agg(pl.len().alias("n_spikes_ref")),
+            true_spikes.group_by("neuron").agg(pl.len().alias("n_true_spikes")),
             on="neuron",
             how="left",
         )
@@ -330,46 +332,32 @@ def compute_scores(spikes_ref, spikes, shifts, n_neurons, which=None):
     )
 
     # Construct the aligned spikes from the shifts
-    spikes = (
-        spikes.join(shifts, how="cross")
-        .select(
-            pl.col("neuron"),
-            pl.col("shift"),
-            pl.col("time") + pl.col("shift"),
-        )
-        .sort("time")
-    )
+    spikes = spikes.select(
+        pl.col("neuron"),
+        (pl.col("time") + shift).mod(period).alias("time"),
+        pl.int_range(pl.len(), dtype=pl.UInt32).alias("id"),
+    ).sort("time")
 
-    # Periodic extension of the reference to cover the range of spikes
-    time_lims = spikes.group_by("shift", "neuron").agg(
-        (pl.col("time").first() - REFRACTORY_PERIOD / 2).alias("time_min"),
-        (pl.col("time").last() + REFRACTORY_PERIOD / 2).alias("time_max"),
-    )
+    # # Periodic extension of the reference to cover the range of spikes
+    # time_lims = spikes.group_by("shift", "neuron").agg(
+    #     (pl.col("time").first() - REFRACTORY_PERIOD / 2).alias("time_min"),
+    #     (pl.col("time").last() + REFRACTORY_PERIOD / 2).alias("time_max"),
+    # )
 
-    ext_spikes_ref = (
-        spikes_ref.join(time_lims, on="neuron")
-        .with_columns(
+    ext_true_spikes = (
+        true_spikes.with_columns(
             rp.extend_periodically(
                 pl.col("time"),
-                pl.col("period"),
-                pl.col("time_min"),
-                pl.col("time_max"),
-            ).alias("time_ref"),
+                period=period,
+                tmin=-REFRACTORY_PERIOD / 2,
+                tmax=period + REFRACTORY_PERIOD / 2,
+            ).alias("true_time"),
+            pl.int_range(pl.len(), dtype=pl.UInt32).alias("true_id"),
         )
-        .explode("time_ref")
+        .explode("true_time")
         .join(n_spikes_per_neuron, on="neuron")
-        .select(
-            pl.col("shift").cast(pl.Float64),
-            pl.col("neuron").cast(pl.UInt32),
-            pl.col("time_ref").cast(pl.Float64),
-            pl.arange(pl.len())
-            .mod(pl.col("n_spikes_ref"))
-            .over("neuron")
-            .cast(pl.UInt32)
-            .alias("id_ref"),
-            # pl.col("n_spikes"),
-        )
-        .sort("time_ref")
+        .select(pl.col("neuron"), pl.col("true_time"), pl.col("true_id"))
+        .sort("true_time")
         # .match_to_schema(
         #     {
         #         "shift": pl.Float64,
@@ -380,71 +368,92 @@ def compute_scores(spikes_ref, spikes, shifts, n_neurons, which=None):
         #     }
         # )
     )
+    # print(
+    #     "comparison:",
+    #     ext_true_spikes.join_asof(
+    #         spikes,
+    #         by="neuron",
+    #         left_on="true_time",
+    #         right_on="time",
+    #         strategy="nearest",
+    #         tolerance=REFRACTORY_PERIOD / 2,
+    #         check_sortedness=False,
+    #         coalesce=False,
+    #     )
+    #     .with_columns((pl.col("time") - pl.col("true_time")).abs().alias("delta"))
+    #     .drop_nulls()
+    #     .filter(pl.col("neuron") == 6),
+    # )
     # print("extended spikes_ref:", ext_spikes_ref)
 
-    scores = n_spikes_per_neuron.join(
-        shifts, how="cross"
-    ).join(  # .drop_nulls("n_spikes")
-        ext_spikes_ref.join_asof(
+    scores = n_spikes_per_neuron.join(  # .drop_nulls("n_spikes")
+        ext_true_spikes.join_asof(
             spikes,
-            by=["shift", "neuron"],
-            left_on="time_ref",
+            by="neuron",
+            left_on="true_time",
             right_on="time",
             strategy="nearest",
             tolerance=REFRACTORY_PERIOD / 2,
             check_sortedness=False,
             coalesce=False,
         )
-        .with_columns((pl.col("time") - pl.col("time_ref")).abs().alias("time_diff"))
-        .sort("time_diff")
+        .with_columns((pl.col("time") - pl.col("true_time")).abs().alias("delta"))
+        .drop_nulls()
+        .sort("delta")
         .unique(
-            ["neuron", "shift", "id_ref"], keep="first"
+            ["neuron", "true_id"], keep="first"
         )  # remove periodic duplicates, keeping the closest
-        .group_by("shift", "neuron")
+        .group_by("neuron")
         .agg(
-            (1.0 - 2.0 * pl.col("time_diff") / REFRACTORY_PERIOD)
+            (1.0 - 2.0 * pl.col("delta") / REFRACTORY_PERIOD)
             .sum()
             .alias("sum_per_neuron")
         ),
-        on=["shift", "neuron"],
+        on=["neuron"],
         how="left",
     )  # optimal one-to-one assignment between spikes
-    # print(scores)
 
-    precisions = (
-        scores.group_by("shift")
-        .agg(
+    precision = 1.0 - (
+        scores.select(
             (1.0 - pl.col("sum_per_neuron").fill_null(0) / pl.col("n_spikes"))
-            .drop_nulls()
-            .sum()
-            .alias("precision")
         )
-        .select(
-            pl.col("shift"), (1.0 - pl.col("precision") / n_neurons).alias("precision")
+        .drop_nulls()
+        .sum()
+        .item()
+        / n_neurons
+    )
+    recall = 1.0 - (
+        scores.select(
+            (1.0 - pl.col("sum_per_neuron").fill_null(0) / pl.col("n_true_spikes"))
         )
+        .drop_nulls()
+        .sum()
+        .item()
+        / n_neurons
     )
-    # print(precisions)
 
-    recalls = (
-        scores.filter(pl.col("n_spikes_ref") > 0)
-        .group_by("shift")
-        .agg(
-            (1.0 - pl.col("sum_per_neuron").fill_null(0) / pl.col("n_spikes_ref"))
-            .drop_nulls()
-            .sum()
-            .alias("recall"),
-        )
-        .select(pl.col("shift"), (1.0 - pl.col("recall") / n_neurons).alias("recall"))
-    )
-    # print(recalls)
+    # # print(precisions)
 
-    if which == "all":
-        return (precisions, recalls)
+    # recalls = (
+    #     scores.filter(pl.col("n_true_spikes") > 0)
+    #     .group_by("shift")
+    #     .agg(
+    #         (1.0 - pl.col("sum_per_neuron").fill_null(0) / pl.col("n_true_spikes"))
+    #         .drop_nulls()
+    #         .sum()
+    #         .alias("recall"),
+    #     )
+    #     .select(pl.col("shift"), (1.0 - pl.col("recall") / n_neurons).alias("recall"))
+    # )
+    # # print(recalls)
 
-    return (
-        precisions.top_k(1, by="precision"),
-        recalls.top_k(1, by="recall"),
-    )
+    return (precision, recall)
+    # if which == "all":
+
+    # return (
+    #     precisions.top_k(1, by="precision"),
+    #     recalls.top_k(1, by="recall"),
+    # )
 
 
 # def compute_precisions(spikes_ref, spikes, shifts, n_neurons, which=None):
